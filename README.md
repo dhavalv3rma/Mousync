@@ -14,8 +14,9 @@ A small ShareMouse-style app for your local network.
 - Reconnects automatically, and sends a heartbeat every 2 s. If the link drops, control returns to your PC.
 - **Runs in the background**: closing the window hides it to the system tray (Windows) or the menu bar (Mac). Use the tray icon to show the window, start or stop sharing, or quit. When started with Windows, it goes straight to the tray.
 - **Emergency return**: press **Esc three times** quickly (or Scroll Lock on Windows) and control comes straight back to your PC.
-- **Same look on Windows and Mac**, with a **dark/light switch** (sun/moon button, top right). The other computer is shown as `OS (name)`, for example `macOS (XD.local)`.
-- The activity log is tucked away: click **Activity** next to the status to show or hide it.
+- **Compact window** (400 px wide), the same on Windows and Mac, with a **dark/light switch** (sun/moon button, top right). The status sits in the pill at the top; hover it, or any row, for details.
+- The **Link** card shows both computers and where the other one sits; pick Left / Right / Top / Bottom under it. *Manual IP & port* is folded away, since auto discovery is the normal path.
+- The latest activity line is under the Start/Stop button: click **Activity** to see the last few lines.
 - Multi-monitor support (it uses the edge of the whole desktop) and correct handling of DPI scaling.
 
 ## Setup (2 minutes)
@@ -25,7 +26,7 @@ A small ShareMouse-style app for your local network.
 4. **PC 2**: type the same code (case, spaces and dashes don't matter), choose the side PC 1 sits on, and click **Start**.
 5. When Windows Firewall asks, click **Allow** on both PCs (TCP 24850 and UDP 24851, private network). The two PCs find each other within a second or two.
 
-**If they don't find each other** (some routers block broadcast between Wi-Fi and wired, or "client isolation" is on), type the other PC's IP into *Other PC's IP* on one PC. That PC then connects directly. Also check that Windows lists the network as **Private**, not Public.
+**If they don't find each other** (some routers block broadcast between Wi-Fi and wired, or "client isolation" is on), open *Manual IP & port* on one PC and type the other PC's IP. That PC then connects directly. Also check that Windows lists the network as **Private**, not Public.
 
 Want a single `.exe` with no Python? Run `build_exe.bat` once, then copy `dist\Mousync.exe` to both PCs. Or download **Mousync-Windows-Portable** from any GitHub Actions run (every push to `main` builds one): it's a single `Mousync-Portable.exe` you just double-click, no install.
 
