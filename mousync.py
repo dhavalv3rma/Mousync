@@ -26,9 +26,11 @@ import json
 import os
 import queue
 import secrets
+import shutil
 import socket
 import struct
 import sys
+import tempfile
 import threading
 import time
 
@@ -71,6 +73,10 @@ VERSION = "1.1"
 DEFAULT_PORT = 24850
 DISCOVERY_PORT = 24851      # UDP, LAN broadcast beacons
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I/L
+FILE_CHUNK = 64 * 1024                 # small pieces so mouse/keyboard messages can slip in between
+CLIP_FILE_LIMIT_MB = 2048              # copied files above this are not sent automatically
+RECEIVE_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "Mousync")   # "Send files..." lands here
+CLIP_CACHE = os.path.join(tempfile.gettempdir(), "Mousync-clipboard")        # copied files land here
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".mousync.json")
 OLD_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".mousebridge.json")  # pre-rename settings
 ASSET_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "assets")
@@ -160,13 +166,17 @@ def clip_get():
         return None
 
 
+def _mac_pb():
+    return AppKit.NSPasteboard.generalPasteboard()
+
+
 def clip_seq():
     """Cheap 'has the clipboard changed?' counter, or None to always re-read."""
     try:
         if IS_WIN:
             return ctypes.windll.user32.GetClipboardSequenceNumber()
         if IS_MAC and AppKit is not None:
-            return AppKit.NSPasteboard.generalPasteboard().changeCount()
+            return _mac_pb().changeCount()
     except Exception:
         pass
     return None
@@ -208,6 +218,183 @@ def broadcast_addrs():
     if not ip.startswith("127."):
         addrs.add(ip.rsplit(".", 1)[0] + ".255")  # directed /24 broadcast: picks the right adapter
     return addrs
+
+
+# ---- files on the clipboard (copied in Explorer / Finder)
+if IS_WIN:
+    from ctypes import wintypes
+    _u32 = ctypes.WinDLL("user32")      # private handles: don't disturb pyperclip's/pynput's argtypes
+    _k32 = ctypes.WinDLL("kernel32")
+    _sh32 = ctypes.WinDLL("shell32")
+    _u32.OpenClipboard.argtypes = [wintypes.HWND]
+    _u32.GetClipboardData.argtypes = [wintypes.UINT]
+    _u32.GetClipboardData.restype = wintypes.HANDLE
+    _u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    _u32.SetClipboardData.restype = wintypes.HANDLE
+    _u32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+    _u32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    _u32.RegisterClipboardFormatW.restype = wintypes.UINT
+    _u32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                     ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                     wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+    _u32.CreateWindowExW.restype = wintypes.HWND
+    _u32.DestroyWindow.argtypes = [wintypes.HWND]
+    _k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    _k32.GlobalAlloc.restype = wintypes.HANDLE
+    _k32.GlobalLock.argtypes = [wintypes.HANDLE]
+    _k32.GlobalLock.restype = ctypes.c_void_p
+    _k32.GlobalUnlock.argtypes = [wintypes.HANDLE]
+    _k32.GlobalFree.argtypes = [wintypes.HANDLE]
+    _sh32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+    _sh32.DragQueryFileW.restype = wintypes.UINT
+CF_HDROP = 15
+
+
+def _win_open_clipboard(hwnd=None):
+    for _ in range(10):                 # another app may be holding it for a moment
+        if _u32.OpenClipboard(hwnd):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _win_global(blob):
+    h = _k32.GlobalAlloc(0x0042, len(blob))  # GMEM_MOVEABLE | GMEM_ZEROINIT
+    ptr = _k32.GlobalLock(h)
+    ctypes.memmove(ptr, blob, len(blob))
+    _k32.GlobalUnlock(h)
+    return h
+
+
+def clip_files():
+    """Paths of files/folders currently copied in Explorer/Finder, or None."""
+    try:
+        if IS_WIN:
+            if not _u32.IsClipboardFormatAvailable(CF_HDROP) or not _win_open_clipboard():
+                return None
+            try:
+                h = _u32.GetClipboardData(CF_HDROP)
+                if not h:
+                    return None
+                out = []
+                for i in range(_sh32.DragQueryFileW(h, 0xFFFFFFFF, None, 0)):
+                    n = _sh32.DragQueryFileW(h, i, None, 0)
+                    buf = ctypes.create_unicode_buffer(n + 1)
+                    _sh32.DragQueryFileW(h, i, buf, n + 1)
+                    out.append(buf.value)
+                return out or None
+            finally:
+                _u32.CloseClipboard()
+        if IS_MAC and AppKit is not None:
+            pb = _mac_pb()
+            urls = pb.readObjectsForClasses_options_(
+                [AppKit.NSURL], {AppKit.NSPasteboardURLReadingFileURLsOnlyKey: True})
+            return [str(u.path()) for u in urls] if urls else None
+    except Exception:
+        pass
+    return None
+
+
+def clip_set_files(paths):
+    """Put files on the clipboard so Paste in Explorer/Finder copies them."""
+    try:
+        if IS_WIN:
+            # DROPFILES header (pFiles=20, pt=0,0, fNC=0, fWide=1) + double-NUL-terminated UTF-16 list
+            blob = struct.pack("<IiiiI", 20, 0, 0, 0, 1) + ("\0".join(paths) + "\0\0").encode("utf-16-le")
+            # SetClipboardData fails when the clipboard has no owner window, so make a throwaway one
+            hwnd = _u32.CreateWindowExW(0, "STATIC", None, 0, 0, 0, 0, 0, None, None, None, None)
+            try:
+                if not _win_open_clipboard(hwnd):
+                    return False
+                try:
+                    _u32.EmptyClipboard()
+                    h = _win_global(blob)
+                    if not _u32.SetClipboardData(CF_HDROP, h):
+                        _k32.GlobalFree(h)
+                        return False
+                    effect = _u32.RegisterClipboardFormatW("Preferred DropEffect")
+                    h2 = _win_global(struct.pack("<I", 1))  # DROPEFFECT_COPY: paste copies, never moves
+                    if not _u32.SetClipboardData(effect, h2):
+                        _k32.GlobalFree(h2)
+                    return True
+                finally:
+                    _u32.CloseClipboard()
+            finally:
+                _u32.DestroyWindow(hwnd)
+        if IS_MAC and AppKit is not None:
+            pb = _mac_pb()
+            pb.clearContents()
+            return bool(pb.writeObjects_([AppKit.NSURL.fileURLWithPath_(p) for p in paths]))
+    except Exception:
+        pass
+    return False
+
+
+def gather_files(paths):
+    """Expand copied files/folders into (source, relative/posix/path, size) plus folder list."""
+    files, dirs, total = [], [], 0
+    for p in paths:
+        p = os.path.abspath(p).rstrip("/\\")
+        base = os.path.basename(p) or "item"
+        if os.path.isdir(p):
+            dirs.append(base)
+            for root, dns, fns in os.walk(p):
+                rel_root = os.path.relpath(root, os.path.dirname(p)).replace(os.sep, "/")
+                dirs.extend(f"{rel_root}/{d}" for d in dns)
+                for fn in fns:
+                    if fn in (".DS_Store", "Thumbs.db", "desktop.ini"):
+                        continue
+                    full = os.path.join(root, fn)
+                    size = os.path.getsize(full)
+                    files.append((full, f"{rel_root}/{fn}", size))
+                    total += size
+        elif os.path.isfile(p):
+            size = os.path.getsize(p)
+            files.append((p, base, size))
+            total += size
+    return files, dirs, total
+
+
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+
+
+def safe_rel(rel):
+    """A path from the other PC, made safe: no '..', no absolute paths, legal names on this OS."""
+    parts = [x for x in str(rel).replace("\\", "/").split("/") if x not in ("", ".", "..")]
+    clean = []
+    for x in parts:
+        if IS_WIN:
+            x = "".join("_" if c in '<>:"|?*' or ord(c) < 32 else c for c in x).rstrip(" .") or "_"
+            if x.split(".")[0].upper() in _WIN_RESERVED:
+                x = "_" + x
+        else:
+            x = x.replace("\0", "")
+        clean.append(x)
+    return os.path.join(*clean) if clean else None
+
+
+def unique_path(path):
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    i = 2
+    while os.path.exists(f"{stem} ({i}){ext}"):
+        i += 1
+    return f"{stem} ({i}){ext}"
+
+
+def fmt_size(n):
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def describe(files, dirs):
+    tops = {rel.split("/")[0] for _, rel, _ in files} | {d.split("/")[0] for d in dirs}
+    if len(tops) == 1:
+        return f'"{next(iter(tops))}"'
+    return f"{len(tops)} items"
 
 
 # --------------------------------------------------------------------------- keys
@@ -280,7 +467,10 @@ class Channel:
         self.lock = threading.Lock()
 
     def send(self, obj):
-        data = json.dumps(obj, separators=(",", ":")).encode()
+        self.send_raw(json.dumps(obj, separators=(",", ":")).encode())
+
+    def send_raw(self, data):
+        """Frames whose plaintext starts with 0x01 are file chunks: 0x01 + 8-byte transfer id + bytes."""
         nonce = os.urandom(12)
         body = nonce + self.aes.encrypt(nonce, data, None)
         with self.lock:
@@ -291,7 +481,10 @@ class Channel:
         if n > 8_000_000:
             raise ConnectionError("frame too large")
         body = self._exact(n)
-        return json.loads(self.aes.decrypt(body[:12], body[12:], None))
+        plain = self.aes.decrypt(body[:12], body[12:], None)
+        if plain[:1] == b"\x01":
+            return {"t": "chunk", "id": plain[1:9].hex(), "data": plain[9:]}
+        return json.loads(plain)
 
     def _exact(self, n):
         buf = bytearray()
@@ -350,6 +543,11 @@ class Bridge:
         self.peer_primary = False
         self.last_clip = None    # last clipboard text sent or received (prevents echo loops)
         self.clip_mark = None
+        self.last_files = ()     # last file list copied here or received (prevents echo loops)
+        self.peer_files = False  # does the other PC understand file transfers?
+        self.tx_id = None        # id of the transfer we are sending (a newer copy cancels it)
+        self.rx = None           # transfer we are receiving
+        self.last_input = 0.0
         self.esc_times = []
         self.held = set()        # keys we are holding down while being controlled
         self.held_btn = set()
@@ -398,6 +596,8 @@ class Bridge:
             elif self.state == REMOTE:
                 self._go_local(0.5)      # also gives the Mac its cursor back
             self.state = LOCAL
+        self.tx_id = None
+        self._rx_abort()
         for l in (self.ml, self.kl):
             if l:
                 l.stop()
@@ -466,13 +666,17 @@ class Bridge:
                     continue
                 chan = Channel(sock, self.key)
                 chan.send({"t": "hello", "name": socket.gethostname(), "os": OSNAME, "v": VERSION,
-                           "primary": bool(self.cfg.get("primary")), "can_control": CAN_CONTROL})
+                           "primary": bool(self.cfg.get("primary")), "can_control": CAN_CONTROL,
+                           "files": True})
                 hello = chan.recv()
                 if hello.get("t") != "hello":
                     raise ConnectionError("bad handshake")
                 self.peer_os, self.peer_name = hello.get("os"), hello.get("name", "?")
                 self.peer_primary = bool(hello.get("primary"))
-                self.last_clip, self.clip_mark = clip_get(), clip_seq()  # sync new copies, not old ones
+                self.peer_files = bool(hello.get("files"))
+                # sync new copies only, not whatever was already on the clipboard
+                self.last_clip, self.clip_mark = clip_get(), clip_seq()
+                self.last_files = tuple(clip_files() or ())
                 with self.out.mutex:
                     self.out.queue.clear()
                 self.chan = chan
@@ -488,6 +692,8 @@ class Bridge:
             finally:
                 was = self.chan is not None
                 self.chan = None
+                self.tx_id = None
+                self._rx_abort()
                 with self.lock:
                     if self.state == REMOTE:
                         self._go_local(0.5)
@@ -590,11 +796,230 @@ class Bridge:
             if mark is not None and mark == self.clip_mark:
                 continue          # unchanged: skip reading it
             self.clip_mark = mark
+            files = clip_files()
+            if files:                 # files copied in Explorer/Finder
+                if tuple(files) != self.last_files:
+                    self.last_files = tuple(files)
+                    self.last_clip = clip_get()  # Finder also puts the names as text: don't send those
+                    if self.peer_files:
+                        self.send_files(files, "clip")
+                continue
             text = clip_get()
             if not text or text == self.last_clip:
                 continue
             self.last_clip = text
             self.send({"t": "clip", "text": text})
+
+    def base_status(self):
+        peer = self.peer_name
+        if self.chan is None:
+            return "Not connected"
+        if self.state == REMOTE:
+            return f"Controlling {peer}  (Esc x3 = come back)"
+        if self.state == CONTROLLED:
+            return f"Controlled by {peer}"
+        return f"Connected to {peer} ({self.peer_os})"
+
+    # ---- files: sending
+    def send_files(self, paths, mode="send"):
+        """mode 'clip': files copied here, pasteable there. mode 'send': saved to Downloads/Mousync there."""
+        threading.Thread(target=self._tx_files, args=(list(paths), mode), daemon=True).start()
+
+    def _tx_files(self, paths, mode):
+        chan = self.chan
+        if chan is None:
+            self.log("Not connected, so the files were not sent.")
+            return
+        if not self.peer_files:
+            self.log(f"{self.peer_name} runs an older Mousync without file sharing. Update it to share files.")
+            return
+        try:
+            files, dirs, total = gather_files(paths)
+        except OSError as e:
+            self.log(f"Can't read the files: {e}")
+            return
+        if not files and not dirs:
+            return
+        what = describe(files, dirs)
+        limit = int(self.cfg.get("file_limit_mb", CLIP_FILE_LIMIT_MB)) * 1024 * 1024
+        if mode == "clip" and total > limit:
+            self.log(f"Copied {what} ({fmt_size(total)}): over the {fmt_size(limit)} limit for automatic sharing, "
+                     "so it was not sent. Use Send files... to send it anyway.")
+            return
+        tid = secrets.token_hex(8)
+        self.tx_id = tid  # a newer copy replaces this transfer
+        raw = b"\x01" + bytes.fromhex(tid)
+        sent, shown, start = 0, 0.0, time.time()
+        try:
+            chan.send({"t": "fstart", "id": tid, "mode": mode, "total": total, "dirs": dirs,
+                       "files": [{"p": rel, "n": n} for _, rel, n in files]})
+            for src, rel, n in files:
+                with open(src, "rb") as f:
+                    left = n
+                    while left > 0:
+                        if self.tx_id != tid or self.chan is not chan:
+                            raise InterruptedError
+                        # input first: wait for queued mouse/keyboard messages, and pace while they flow
+                        while not self.out.empty() and self.chan is chan:
+                            time.sleep(0.001)
+                        if time.time() - self.last_input < 0.1:
+                            time.sleep(0.004)
+                        data = f.read(min(FILE_CHUNK, left))
+                        if not data:
+                            raise OSError(f"{rel} got shorter while it was being sent")
+                        chan.send_raw(raw + data)
+                        left -= len(data)
+                        sent += len(data)
+                        if time.time() - shown > 0.5:
+                            shown = time.time()
+                            self.status(f"Sending {what}: {100 * sent // max(total, 1)}%")
+            chan.send({"t": "fend", "id": tid})
+            secs = max(time.time() - start, 0.001)
+            self.log(f"Sent {what} ({fmt_size(total)}) to {self.peer_name}"
+                     + (f" at {fmt_size(total / secs)}/s" if total > 5_000_000 else "")
+                     + (". Paste it there." if mode == "clip" else "."))
+        except InterruptedError:
+            try:
+                chan.send({"t": "fabort", "id": tid})
+            except Exception:
+                pass
+        except (OSError, ConnectionError) as e:
+            self.log(f"Sending {what} failed: {e}")
+            try:
+                chan.send({"t": "fabort", "id": tid})
+            except Exception:
+                pass
+        finally:
+            if self.tx_id == tid:
+                self.tx_id = None
+            self.status(self.base_status())
+
+    # ---- files: receiving
+    def _rx_start(self, m):
+        self._rx_abort()                      # a newer transfer replaces an unfinished one
+        mode = "send" if m.get("mode") == "send" else "clip"
+        base = RECEIVE_DIR if mode == "send" else CLIP_CACHE
+        tid = str(m.get("id", ""))[:16]
+        tmp = os.path.join(base, ".incoming-" + tid)
+        try:
+            os.makedirs(tmp, exist_ok=True)
+            tops = []
+            for d in m.get("dirs", []):
+                rel = safe_rel(d)
+                if rel:
+                    os.makedirs(os.path.join(tmp, rel), exist_ok=True)
+                    tops.append(rel.split(os.sep)[0])
+            entries = []
+            for f in m.get("files", []):
+                rel = safe_rel(f["p"])
+                if not rel:
+                    raise ValueError("bad file name")
+                entries.append((os.path.join(tmp, rel), int(f["n"])))
+                tops.append(rel.split(os.sep)[0])
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            self.log(f"Can't receive files: {e}")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return
+        self.rx = {"id": tid, "mode": mode, "tmp": tmp, "files": entries, "idx": 0, "fh": None,
+                   "left": 0, "got": 0, "total": int(m.get("total", 0)), "shown": 0.0,
+                   "tops": list(dict.fromkeys(tops)), "start": time.time()}
+        try:
+            self._rx_next()
+        except OSError as e:
+            self.log(f"Can't save received files: {e}")
+            self._rx_abort()
+
+    def _rx_next(self):
+        rx = self.rx
+        while rx["idx"] < len(rx["files"]):
+            path, n = rx["files"][rx["idx"]]
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fh = open(path, "wb")
+            if n > 0:
+                rx["fh"], rx["left"] = fh, n
+                return
+            fh.close()                        # empty file: nothing to wait for
+            rx["idx"] += 1
+        rx["fh"] = None
+
+    def _rx_chunk(self, m):
+        rx = self.rx
+        if not rx or m["id"] != rx["id"] or rx["fh"] is None:
+            return                            # leftover piece of a cancelled transfer
+        data = m["data"]
+        try:
+            if len(data) > rx["left"]:
+                raise OSError("the other PC sent more data than announced")
+            rx["fh"].write(data)
+            rx["left"] -= len(data)
+            rx["got"] += len(data)
+            if rx["left"] == 0:
+                rx["fh"].close()
+                rx["idx"] += 1
+                self._rx_next()
+        except OSError as e:
+            self.log(f"Receiving files failed: {e}")
+            self._rx_abort()
+            return
+        if time.time() - rx["shown"] > 0.5:
+            rx["shown"] = time.time()
+            self.status(f"Receiving from {self.peer_name}: {100 * rx['got'] // max(rx['total'], 1)}%")
+
+    def _rx_end(self, m):
+        rx = self.rx
+        if not rx or m.get("id") != rx["id"]:
+            return
+        if rx["fh"] is not None or rx["idx"] < len(rx["files"]) or rx["got"] != rx["total"]:
+            self.log("Received files were incomplete, so they were discarded.")
+            self._rx_abort()
+            return
+        self.rx = None
+        what = rx["tops"][0] if len(rx["tops"]) == 1 else f"{len(rx['tops'])} items"
+        try:
+            if rx["mode"] == "send":          # move each item into Downloads/Mousync, never overwriting
+                final = [shutil.move(os.path.join(rx["tmp"], t), unique_path(os.path.join(RECEIVE_DIR, t)))
+                         for t in rx["tops"]]
+                shutil.rmtree(rx["tmp"], ignore_errors=True)
+                where = RECEIVE_DIR
+            else:                             # keep in the clipboard cache, ready to paste
+                batch = os.path.join(CLIP_CACHE, time.strftime("%Y%m%d-%H%M%S-") + rx["id"][:6])
+                os.rename(rx["tmp"], batch)
+                final = [os.path.join(batch, t) for t in rx["tops"]]
+                self._prune_clip_cache(keep=batch)
+                where = None
+        except OSError as e:
+            self.log(f"Can't save received files: {e}")
+            shutil.rmtree(rx["tmp"], ignore_errors=True)
+            return
+        if self.cfg.get("clipboard", True) and clip_set_files(final):
+            self.last_files = tuple(final)
+            self.clip_mark = clip_seq()
+        paste = "Cmd+V" if IS_MAC else "Ctrl+V"
+        msg = f"Received {what} ({fmt_size(rx['total'])}) from {self.peer_name}."
+        msg += f" Saved in {where}." if where else f" Paste it with {paste} in a folder."
+        self.log(msg)
+        self.status(self.base_status())
+
+    def _rx_abort(self):
+        rx, self.rx = self.rx, None
+        if rx:
+            try:
+                if rx["fh"]:
+                    rx["fh"].close()
+            except OSError:
+                pass
+            shutil.rmtree(rx["tmp"], ignore_errors=True)
+
+    @staticmethod
+    def _prune_clip_cache(keep, n=3):
+        """Copied files are kept only for the last few copies; older ones are deleted."""
+        try:
+            batches = sorted(d for d in os.listdir(CLIP_CACHE) if not d.startswith("."))
+            for d in batches[:-n]:
+                if os.path.join(CLIP_CACHE, d) != keep:
+                    shutil.rmtree(os.path.join(CLIP_CACHE, d), ignore_errors=True)
+        except OSError:
+            pass
 
     def _send_loop(self):
         while self.running:
@@ -608,6 +1033,8 @@ class Bridge:
             try:
                 if callable(item):
                     item = item()
+                if item.get("t") != "ping":
+                    self.last_input = time.time()
                 chan.send(item)
             except Exception as e:
                 self.log(f"Send failed: {e}")
@@ -624,6 +1051,20 @@ class Bridge:
                 self.last_clip = text
                 clip_set(text)
                 self.clip_mark = clip_seq()
+            return
+        if t == "chunk":
+            self._rx_chunk(m)
+            return
+        if t == "fstart":
+            self._rx_start(m)
+            return
+        if t == "fend":
+            self._rx_end(m)
+            return
+        if t == "fabort":
+            if self.rx and self.rx["id"] == m.get("id"):
+                self._rx_abort()
+                self.status(self.base_status())
             return
         if t == "role":
             self.peer_primary = bool(m.get("primary"))
@@ -656,7 +1097,7 @@ class Bridge:
                 if self.state == CONTROLLED:
                     self._release_playback()
                     self.state = LOCAL
-                    self.status(f"Connected to {self.peer_name}")
+                    self.status(self.base_status())
             return
         if self.state != CONTROLLED:
             return
@@ -954,7 +1395,7 @@ def make_tray(menu_items, title):
 # --------------------------------------------------------------------------- GUI
 def run_gui():
     import tkinter as tk
-    from tkinter import messagebox, ttk
+    from tkinter import filedialog, messagebox, ttk
 
     cfg = load_config()
     root = tk.Tk()
@@ -999,7 +1440,7 @@ def run_gui():
         ttk.Radiobutton(sf, text=s.capitalize(), value=s, variable=side_v).pack(side="left", padx=2)
 
     clip_v = tk.BooleanVar(value=cfg.get("clipboard", True))
-    ttk.Checkbutton(frm, text="Share clipboard both ways (text)", variable=clip_v).grid(
+    ttk.Checkbutton(frm, text="Share clipboard both ways (text and copied files)", variable=clip_v).grid(
         column=0, row=6, columnspan=4, sticky="w", pady=(4, 0))
 
     prim_v = tk.BooleanVar(value=cfg.get("primary", False))
@@ -1083,6 +1524,17 @@ def run_gui():
     btn = ttk.Button(frm, text="Start", command=toggle)
     btn.grid(column=0, row=8, sticky="w", pady=4)
 
+    def send_files_dialog():
+        b = state["bridge"]
+        if not b or b.chan is None:
+            messagebox.showinfo(APP, "Connect to the other PC first.")
+            return
+        paths = filedialog.askopenfilenames(parent=root, title=f"Send files to {b.peer_name}")
+        if paths:
+            b.send_files(paths, "send")
+
+    ttk.Button(frm, text="Send files...", command=send_files_dialog).grid(column=1, row=8, sticky="w", pady=4)
+
     def pump():
         while True:
             try:
@@ -1134,6 +1586,7 @@ def run_gui():
         state["tray"] = make_tray([
             pystray.MenuItem(f"Show {APP}", ui(show_window), default=True),
             pystray.MenuItem(lambda _: "Stop sharing" if state["bridge"] else "Start sharing", ui(toggle)),
+            pystray.MenuItem("Send files...", ui(lambda: (show_window(), send_files_dialog()))),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(f"Quit {APP}", ui(quit_app)),
         ], f"{APP}: Stopped")

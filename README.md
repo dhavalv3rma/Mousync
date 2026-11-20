@@ -6,6 +6,7 @@ A small ShareMouse-style app for your local network.
 - Move the cursor off the screen edge that faces the other PC, and your mouse and keyboard now control that PC.
 - Move it back off the opposite edge to return.
 - **Shared clipboard, both ways**: copy text on either PC and paste it on the other, straight away.
+- **File sharing**: copy files or folders in Explorer/Finder on one PC, then paste them in a folder on the other (Ctrl+V / Cmd+V). Or click **Send files...** (also in the tray menu) to drop files into `Downloads/Mousync` on the other PC.
 - Mouse buttons (left, right, middle, back and forward), scroll wheel, and the full keyboard, including shortcuts like Ctrl+C or Alt+Tab.
 - **Both directions**: Windows and Mac PCs can each control the other. Tick **Primary controller** on one PC to make it the only one that controls; leave it unticked on both and either PC can take over. The setting applies immediately, even while connected.
 - **Finds the other PC automatically**: type the same pairing code on both PCs and they connect. No IP address needed.
@@ -37,7 +38,16 @@ Terminal mode: `python mousync.py --nogui --code K7MQ-2PXH --side right [--peer 
 - **Linux:** can be controlled, but can't control the other PC.
 - **Mac ↔ Windows keys:** Cmd and Ctrl swap places, so the usual shortcuts just work. Cmd+C on a Mac keyboard is Ctrl+C on Windows, and Ctrl+C on a Windows keyboard is Cmd+C on a Mac. Option = Alt.
 - **While controlling:** the local cursor stays parked in the middle of your screen.
-- **Clipboard:** text only (not images or files).
+- **Clipboard:** text and files. Images copied from apps (screenshots, "Copy image") are not shared yet.
+- **How file sharing works, and its limits:**
+  - Copied files are sent **as soon as you copy**, before you paste, so they're ready when you do. That uses network bandwidth even if you never paste. Copies over **2 GB** are not sent automatically (set `"file_limit_mb"` in `~/.mousync.json` to change this); use **Send files...** for those.
+  - Paste only works **once the transfer has finished**. Watch the status line ("Receiving...: 45%"). Pasting earlier pastes whatever was on that PC's clipboard before.
+  - Copying something new cancels a transfer that hasn't finished.
+  - Copied files are kept in a temporary folder on the receiving PC, and only the last 3 copies are kept. If you paste later than that, the files are gone; use **Send files...** for anything you want to keep. Files sent with **Send files...** stay in `Downloads/Mousync` and are never overwritten (a second `report.pdf` becomes `report (2).pdf`).
+  - Files go over the same encrypted link as the mouse and keyboard. Mouse and keyboard messages always go first, and the transfer slows down while you're controlling, but a big transfer **in the same direction** you're controlling can still make the pointer feel a little sluggish on Wi-Fi.
+  - No drag-and-drop between screens.
+  - Speed is whatever your network gives (wired gigabit: about 100 MB/s; Wi-Fi: often 10 to 50 MB/s).
+  - File dates and permissions aren't kept (received files get the current time), and Mac-only extras (tags, resource forks) are dropped. Names Windows can't use (like `a:b.txt`) are renamed (`a_b.txt`).
 - Settings are saved to `~/.mousync.json`.
 
 ## Building the installers (Mousync-Setup.exe + Mousync.dmg)
