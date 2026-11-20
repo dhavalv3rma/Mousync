@@ -19,7 +19,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pyinstaller
       - name: Build MouseBridge.exe
-        run: pyinstaller --noconfirm --onefile --windowed --name MouseBridge mousebridge.py
+        run: pyinstaller --noconfirm --onefile --windowed --name MouseBridge --icon assets/icon.ico --add-data "assets;assets" --hidden-import pystray._win32 mousebridge.py
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
       - name: Build installer
@@ -41,6 +41,7 @@ jobs:
       - name: Build MouseBridge.app
         run: |
           pyinstaller --noconfirm --windowed --name MouseBridge \
+            --icon assets/icon.icns --add-data "assets:assets" --hidden-import pystray._darwin \
             --osx-bundle-identifier in.dhavalverma.mousebridge mousebridge.py
           codesign --force --deep --sign - dist/MouseBridge.app
       - name: Build DMG
@@ -48,6 +49,9 @@ jobs:
           mkdir dmg
           cp -R dist/MouseBridge.app dmg/
           ln -s /Applications dmg/Applications
+          cp assets/icon.icns dmg/.VolumeIcon.icns      # icon for the mounted disk
+          SetFile -c icnC dmg/.VolumeIcon.icns
+          SetFile -a C dmg
           hdiutil create -volname MouseBridge -srcfolder dmg -ov -format UDZO MouseBridge.dmg
       - uses: actions/upload-artifact@v4
         with:

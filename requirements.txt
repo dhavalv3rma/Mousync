@@ -1,3 +1,5 @@
 pynput>=1.7.6
 cryptography>=42
 pyperclip>=1.8
+pystray>=0.19.5
+Pillow>=10

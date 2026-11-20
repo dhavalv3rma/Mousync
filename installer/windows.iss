@@ -1,7 +1,7 @@
 ; Inno Setup script - builds MouseBridge-Setup.exe
 [Setup]
 AppName=MouseBridge
-AppVersion=1.0
+AppVersion=1.1
 AppPublisher=Dhaval Verma
 DefaultDirName={autopf}\MouseBridge
 DefaultGroupName=MouseBridge
@@ -12,6 +12,7 @@ Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=admin
 WizardStyle=modern
+SetupIconFile=..\assets\icon.ico
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"
@@ -29,7 +30,9 @@ Name: "{userstartup}\MouseBridge"; Filename: "{app}\MouseBridge.exe"; Parameters
 [Run]
 ; open the firewall port on private networks so the two PCs can connect
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""MouseBridge"" dir=in action=allow protocol=TCP localport=24850 profile=private"; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""MouseBridge Discovery"" dir=in action=allow protocol=UDP localport=24851 profile=private"; Flags: runhidden
 Filename: "{app}\MouseBridge.exe"; Description: "Launch MouseBridge"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""MouseBridge"""; Flags: runhidden; RunOnceId: "DelFirewall"
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""MouseBridge Discovery"""; Flags: runhidden; RunOnceId: "DelFirewallDisc"

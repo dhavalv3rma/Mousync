@@ -4,11 +4,13 @@ MouseBridge - share one mouse & keyboard between two computers on the same netwo
 (a small, self-hosted alternative to ShareMouse).
 
 How it works
-  * Run MouseBridge on both PCs with the same password.
+  * Run MouseBridge on both PCs with the same pairing code. They find each other on the
+    local network automatically (UDP broadcast); no IP address needed.
   * Push the cursor off the screen edge that faces the other PC. Your mouse and keyboard
     now control that PC. Push it back off the opposite edge to return.
   * The clipboard (text) follows the cursor between the two PCs.
-  * All traffic is encrypted with AES-256-GCM, using a key derived from the password.
+  * All traffic is encrypted with AES-256-GCM, using a key derived from the pairing code.
+    Discovery beacons carry only an HMAC proof of the code, never the code itself.
   * Emergency key: Scroll Lock brings control back to this PC at once.
 
 Platform support
@@ -18,9 +20,11 @@ Platform support
 import argparse
 import ctypes
 import hashlib
+import hmac
 import json
 import os
 import queue
+import secrets
 import socket
 import struct
 import sys
@@ -49,9 +53,12 @@ except ImportError:  # clipboard sync is optional
     pyperclip = None
 
 APP = "MouseBridge"
-VERSION = "1.0"
+VERSION = "1.1"
 DEFAULT_PORT = 24850
+DISCOVERY_PORT = 24851      # UDP, LAN broadcast beacons
+CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I/L
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".mousebridge.json")
+ASSET_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "assets")
 OSNAME = "win" if IS_WIN else ("mac" if sys.platform == "darwin" else "linux")
 
 LOCAL, REMOTE, CONTROLLED = "local", "remote", "controlled"
@@ -125,6 +132,31 @@ def clip_set(s):
 
 def derive_key(password):
     return hashlib.pbkdf2_hmac("sha256", password.encode(), b"mousebridge-v1", 200_000)
+
+
+def new_pairing_code():
+    c = "".join(secrets.choice(CODE_ALPHABET) for _ in range(8))
+    return c[:4] + "-" + c[4:]
+
+
+def normalize_code(code):
+    """Pairing codes are case/space/dash-insensitive, so 'k7mq 2pxh' == 'K7MQ-2PXH'."""
+    c = "".join(ch for ch in code.upper() if ch.isalnum())
+    if len(c) == 8 and all(ch in CODE_ALPHABET for ch in c):
+        return c[:4] + "-" + c[4:]
+    return code  # a free-form password from 1.0: use as-is
+
+
+def beacon_tag(key, node_id, port):
+    return hmac.new(key, f"mb-discover|{node_id}|{port}".encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def broadcast_addrs():
+    addrs = {"255.255.255.255"}
+    ip = local_ip()
+    if not ip.startswith("127."):
+        addrs.add(ip.rsplit(".", 1)[0] + ".255")  # directed /24 broadcast: picks the right adapter
+    return addrs
 
 
 # --------------------------------------------------------------------------- keys
@@ -223,8 +255,13 @@ class Bridge:
     def __init__(self, cfg, log, status):
         self.cfg = cfg
         self.log = log
-        self.status = status
-        self.key = derive_key(cfg["password"])
+        self._status, self._last_status = status, None
+        self.key = derive_key(normalize_code(cfg["password"]))
+        self.auto = not cfg.get("peer", "").strip()
+        self.node_id = secrets.token_hex(8)
+        self.found = None        # (ip, port, node_id, name, last_seen) of a matching peer
+        self.mismatch = set()    # peers seen with a different code (logged once)
+        self.dsock = None
         self.lock = threading.RLock()
         self.state = LOCAL
         self.chan = None
@@ -243,11 +280,18 @@ class Bridge:
         self.mctl = mouse.Controller()
         self.kctl = keyboard.Controller()
 
+    def status(self, s):
+        if s != self._last_status:   # the search loop re-reports every second
+            self._last_status = s
+            self._status(s)
+
     # ---- lifecycle
     def start(self):
         self.running = True
         threading.Thread(target=self._net_loop, daemon=True).start()
         threading.Thread(target=self._send_loop, daemon=True).start()
+        if self.auto:
+            threading.Thread(target=self._disc_loop, daemon=True).start()
         if IS_WIN:
             self.ml = mouse.Listener(win32_event_filter=self._mfilter)
             self.kl = keyboard.Listener(win32_event_filter=self._kfilter)
@@ -270,11 +314,12 @@ class Bridge:
                 l.stop()
         if self.chan:
             self.chan.close()
-        if self.lsock:
-            try:
-                self.lsock.close()
-            except OSError:
-                pass
+        for s in (self.lsock, self.dsock):
+            if s:
+                try:
+                    s.close()
+                except OSError:
+                    pass
         self.status("Stopped")
 
     def send(self, item):
@@ -299,11 +344,25 @@ class Bridge:
                 ls.listen(1)
                 ls.settimeout(1.0)
                 self.lsock = ls
-            self.status(f"Waiting for the other PC ... (this PC: {local_ip()}  port {port})")
-            try:
-                s, _ = self.lsock.accept()
-            except socket.timeout:
-                return None
+            f = self.found
+            if f and time.time() - f[4] > 5:     # peer stopped beaconing
+                f = self.found = None
+            if f and self.node_id < f[2]:          # tie-break: lower id dials, higher id waits
+                self.status(f"Found {f[3]} at {f[0]}, connecting ...")
+                try:
+                    s = socket.create_connection((f[0], f[1]), timeout=3)
+                except OSError:
+                    time.sleep(1)
+                    raise
+            else:
+                if f:
+                    self.status(f"Found {f[3]} at {f[0]}, waiting for it to connect ...")
+                else:
+                    self.status(f"Searching the network for the other PC ... (this PC: {local_ip()})")
+                try:
+                    s, _ = self.lsock.accept()
+                except socket.timeout:
+                    return None
         s.settimeout(10)
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -351,6 +410,57 @@ class Bridge:
                     self.log("Disconnected")
             if self.running and self.cfg.get("peer", "").strip():
                 time.sleep(2)
+
+    def _disc_loop(self):
+        """Broadcast a beacon every second and listen for the other PC's beacon."""
+        port = int(self.cfg["port"])
+        try:
+            ds = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            ds.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                try:
+                    ds.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except OSError:
+                    pass
+            ds.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            ds.bind(("", DISCOVERY_PORT))
+            ds.settimeout(0.5)
+            self.dsock = ds
+        except OSError as e:
+            self.log(f"Auto-discovery unavailable ({e}). Enter the other PC's IP instead.")
+            return
+        beacon = json.dumps({"app": APP, "v": 1, "id": self.node_id, "port": port,
+                             "name": socket.gethostname(),
+                             "tag": beacon_tag(self.key, self.node_id, port)}).encode()
+        next_tx = 0.0
+        while self.running:
+            if time.time() >= next_tx:
+                next_tx = time.time() + 1.0
+                for a in broadcast_addrs():
+                    try:
+                        ds.sendto(beacon, (a, DISCOVERY_PORT))
+                    except OSError:
+                        pass
+            try:
+                data, addr = ds.recvfrom(2048)
+                m = json.loads(data)
+                if m.get("app") != APP or m.get("id") == self.node_id:
+                    continue
+                pid, pport = str(m["id"]), int(m["port"])
+            except socket.timeout:
+                continue
+            except (OSError, ValueError, KeyError, TypeError):
+                if not self.running:
+                    break
+                continue
+            name = str(m.get("name", addr[0]))[:64]
+            if hmac.compare_digest(str(m.get("tag", "")), beacon_tag(self.key, pid, pport)):
+                if not self.found or self.found[2] != pid:
+                    self.log(f"Found {name} ({addr[0]}) with the same pairing code")
+                self.found = (addr[0], pport, pid, name, time.time())
+            elif pid not in self.mismatch:
+                self.mismatch.add(pid)
+                self.log(f"Saw MouseBridge on {name} ({addr[0]}), but it uses a different pairing code")
 
     def _send_loop(self):
         while self.running:
@@ -566,6 +676,51 @@ def save_config(cfg):
         pass
 
 
+# --------------------------------------------------------------------------- tray / menu bar
+def windows_light_taskbar():
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            return winreg.QueryValueEx(k, "SystemUsesLightTheme")[0] == 1
+    except OSError:
+        return False  # Windows default: dark taskbar
+
+
+def make_tray(menu_items, title):
+    """Return a started tray / menu-bar icon, or None if this system has no tray."""
+    import pystray
+    from PIL import Image
+
+    if sys.platform == "darwin":
+        import AppKit
+        import Foundation
+
+        class MacIcon(pystray.Icon):
+            def _assert_image(self):
+                # Sharp @2x template image: macOS tints it for light and dark menu bars.
+                if self._icon_image is not None:
+                    return
+                with open(os.path.join(ASSET_DIR, "tray_mac.png"), "rb") as f:
+                    data = f.read()
+                img = AppKit.NSImage.alloc().initWithData_(Foundation.NSData.dataWithBytes_length_(data, len(data)))
+                h = 16.0
+                img.setSize_((h * self._icon.width / self._icon.height, h))
+                img.setTemplate_(True)
+                self._icon_image = img
+                self._status_item.button().setImage_(img)
+
+        img = Image.open(os.path.join(ASSET_DIR, "tray_mac.png"))
+        icon = MacIcon(APP, img, title, pystray.Menu(*menu_items))
+        icon.run_detached()          # Tk's main loop drives the Cocoa event loop
+    else:
+        name = "tray_black.png" if (IS_WIN and windows_light_taskbar()) else "tray_white.png"
+        img = Image.open(os.path.join(ASSET_DIR, name))
+        icon = pystray.Icon(APP, img, title, pystray.Menu(*menu_items))
+        threading.Thread(target=icon.run, daemon=True).start()
+    return icon
+
+
 # --------------------------------------------------------------------------- GUI
 def run_gui():
     import tkinter as tk
@@ -575,6 +730,10 @@ def run_gui():
     root = tk.Tk()
     root.title(f"{APP} {VERSION}")
     root.resizable(False, False)
+    try:
+        root.iconphoto(True, tk.PhotoImage(file=os.path.join(ASSET_DIR, "icon.png")))
+    except Exception:
+        pass  # running without the assets folder: keep the default icon
     set_fallback_bounds(root.winfo_screenwidth(), root.winfo_screenheight())
     events = queue.Queue()
     state = {"bridge": None}
@@ -584,36 +743,40 @@ def run_gui():
     ttk.Label(frm, text=f"This PC: {socket.gethostname()}   IP: {local_ip()}",
               font=("Segoe UI", 10, "bold")).grid(column=0, row=0, columnspan=4, sticky="w", pady=(0, 8))
 
-    ttk.Label(frm, text="Other PC's IP:").grid(column=0, row=1, sticky="w")
+    ttk.Label(frm, text="Pairing code:").grid(column=0, row=1, sticky="w")
+    pw_v = tk.StringVar(value=cfg["password"] or new_pairing_code())
+    ttk.Entry(frm, textvariable=pw_v, width=22, font=("Consolas", 11)).grid(column=1, row=1, sticky="w")
+    ttk.Button(frm, text="New code", command=lambda: pw_v.set(new_pairing_code())).grid(
+        column=2, row=1, sticky="w", padx=6)
+    ttk.Label(frm, text="Type the same code on the other PC. It is found automatically.",
+              foreground="#666").grid(column=0, row=2, columnspan=4, sticky="w")
+
+    ttk.Label(frm, text="Other PC's IP:").grid(column=0, row=3, sticky="w", pady=(6, 0))
     peer_v = tk.StringVar(value=cfg["peer"])
-    ttk.Entry(frm, textvariable=peer_v, width=22).grid(column=1, row=1, sticky="w")
-    ttk.Label(frm, text="(leave blank on ONE PC; it waits)", foreground="#666").grid(
-        column=2, row=1, columnspan=2, sticky="w", padx=6)
+    ttk.Entry(frm, textvariable=peer_v, width=22).grid(column=1, row=3, sticky="w", pady=(6, 0))
+    ttk.Label(frm, text="(optional: only if auto-find fails)", foreground="#666").grid(
+        column=2, row=3, columnspan=2, sticky="w", padx=6, pady=(6, 0))
 
-    ttk.Label(frm, text="Port:").grid(column=0, row=2, sticky="w")
+    ttk.Label(frm, text="Port:").grid(column=0, row=4, sticky="w")
     port_v = tk.StringVar(value=str(cfg["port"]))
-    ttk.Entry(frm, textvariable=port_v, width=8).grid(column=1, row=2, sticky="w")
+    ttk.Entry(frm, textvariable=port_v, width=8).grid(column=1, row=4, sticky="w")
 
-    ttk.Label(frm, text="Password:").grid(column=0, row=3, sticky="w")
-    pw_v = tk.StringVar(value=cfg["password"])
-    ttk.Entry(frm, textvariable=pw_v, width=22, show="*").grid(column=1, row=3, sticky="w")
-
-    ttk.Label(frm, text="Other PC is on my:").grid(column=0, row=4, sticky="w", pady=(6, 0))
+    ttk.Label(frm, text="Other PC is on my:").grid(column=0, row=5, sticky="w", pady=(6, 0))
     side_v = tk.StringVar(value=cfg["side"])
     sf = ttk.Frame(frm)
-    sf.grid(column=1, row=4, columnspan=3, sticky="w", pady=(6, 0))
+    sf.grid(column=1, row=5, columnspan=3, sticky="w", pady=(6, 0))
     for s in ("left", "right", "top", "bottom"):
         ttk.Radiobutton(sf, text=s.capitalize(), value=s, variable=side_v).pack(side="left", padx=2)
 
     clip_v = tk.BooleanVar(value=cfg.get("clipboard", True))
     ttk.Checkbutton(frm, text="Share clipboard (text)", variable=clip_v).grid(
-        column=0, row=5, columnspan=2, sticky="w", pady=4)
+        column=0, row=6, columnspan=2, sticky="w", pady=4)
 
     status_v = tk.StringVar(value="Stopped")
-    ttk.Label(frm, textvariable=status_v, foreground="#0a5").grid(column=0, row=7, columnspan=4, sticky="w", pady=4)
+    ttk.Label(frm, textvariable=status_v, foreground="#0a5").grid(column=0, row=8, columnspan=4, sticky="w", pady=4)
 
     logbox = scrolledtext.ScrolledText(frm, width=70, height=10, state="disabled", font=("Consolas", 9))
-    logbox.grid(column=0, row=8, columnspan=4, pady=(4, 0))
+    logbox.grid(column=0, row=9, columnspan=4, pady=(4, 0))
 
     def log(s):
         events.put(("log", time.strftime("%H:%M:%S ") + s))
@@ -626,10 +789,12 @@ def run_gui():
             state["bridge"].stop()
             state["bridge"] = None
             btn.config(text="Start")
+            refresh_tray_menu()
             return
-        if not pw_v.get():
-            messagebox.showwarning(APP, "Set a password (same on both PCs).")
+        if not pw_v.get().strip():
+            messagebox.showwarning(APP, "Set a pairing code (the same on both PCs).")
             return
+        pw_v.set(normalize_code(pw_v.get().strip()))
         try:
             port = int(port_v.get())
         except ValueError:
@@ -643,9 +808,17 @@ def run_gui():
         b.start()
         state["bridge"] = b
         btn.config(text="Stop")
+        refresh_tray_menu()
+
+    def refresh_tray_menu():
+        if state.get("tray"):
+            try:
+                state["tray"].update_menu()
+            except Exception:
+                pass
 
     btn = ttk.Button(frm, text="Start", command=toggle)
-    btn.grid(column=0, row=6, sticky="w", pady=4)
+    btn.grid(column=0, row=7, sticky="w", pady=4)
 
     def pump():
         while True:
@@ -653,8 +826,12 @@ def run_gui():
                 kind, s = events.get_nowait()
             except queue.Empty:
                 break
-            if kind == "status":
+            if kind == "call":
+                s()
+            elif kind == "status":
                 status_v.set(s)
+                if state.get("tray"):
+                    state["tray"].title = f"{APP}: {s}"[:127]
             else:
                 logbox.config(state="normal")
                 logbox.insert("end", s + "\n")
@@ -662,15 +839,54 @@ def run_gui():
                 logbox.config(state="disabled")
         root.after(100, pump)
 
-    def on_close():
+    # ---- background mode: closing the window hides it; the tray icon keeps the app alive
+    def ui(fn):  # tray callbacks arrive on the tray's thread; run them on Tk's thread
+        return lambda *_: events.put(("call", fn))
+
+    def show_window():
+        root.deiconify()
+        root.lift()
+        root.focus_force()
+
+    def hide_window():
+        root.withdraw()
+        if not state.get("hinted"):
+            state["hinted"] = True
+            where = "menu bar" if sys.platform == "darwin" else "system tray"
+            log(f"Still running in the background. Use the {where} icon to show or quit {APP}.")
+
+    def quit_app():
         if state["bridge"]:
             state["bridge"].stop()
+            state["bridge"] = None
+        if state.get("tray"):
+            try:
+                state["tray"].stop()
+            except Exception:
+                pass
         root.destroy()
 
-    root.protocol("WM_DELETE_WINDOW", on_close)
+    try:
+        import pystray
+        state["tray"] = make_tray([
+            pystray.MenuItem(f"Show {APP}", ui(show_window), default=True),
+            pystray.MenuItem(lambda _: "Stop sharing" if state["bridge"] else "Start sharing", ui(toggle)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(f"Quit {APP}", ui(quit_app)),
+        ], f"{APP}: Stopped")
+    except Exception as e:  # no tray available (e.g. some Linux desktops): closing quits
+        state["tray"] = None
+        log(f"No tray icon ({e}); closing the window will quit.")
+
+    root.protocol("WM_DELETE_WINDOW", hide_window if state["tray"] else quit_app)
+    if sys.platform == "darwin":
+        root.createcommand("tk::mac::ReopenApplication", show_window)  # click on the Dock icon
+        root.createcommand("tk::mac::Quit", quit_app)                  # Cmd+Q / Dock > Quit
     pump()
     if cfg["password"] and "--autostart" in sys.argv:
         toggle()
+        if state["tray"]:
+            root.withdraw()  # started with the computer: go straight to the tray
     root.mainloop()
 
 
@@ -683,8 +899,12 @@ def run_cli(args):
             cfg[k] = v
     if args.no_clipboard:
         cfg["clipboard"] = False
+    if args.code:
+        cfg["password"] = args.code
     if not cfg["password"]:
-        sys.exit("A password is required (--password).")
+        cfg["password"] = new_pairing_code()
+        print(f"Pairing code: {cfg['password']}   (run the other PC with --code {cfg['password']})")
+    save_config(cfg)
     if not IS_WIN:
         try:
             import tkinter as tk
@@ -707,9 +927,10 @@ def main():
     p = argparse.ArgumentParser(description=f"{APP}: share one mouse/keyboard between two PCs")
     p.add_argument("--nogui", action="store_true", help="run in the terminal")
     p.add_argument("--autostart", action="store_true", help="GUI: start with saved settings")
-    p.add_argument("--peer", help="IP of the other PC (omit on the PC that waits)")
+    p.add_argument("--peer", help="IP of the other PC (omit to find it automatically)")
     p.add_argument("--port", type=int)
-    p.add_argument("--password")
+    p.add_argument("--code", help="pairing code (same on both PCs)")
+    p.add_argument("--password", help=argparse.SUPPRESS)  # 1.0 name for --code
     p.add_argument("--side", choices=["left", "right", "top", "bottom"], help="where the other PC sits")
     p.add_argument("--no-clipboard", action="store_true")
     args = p.parse_args()
