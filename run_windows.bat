@@ -1,4 +1,4 @@
 @echo off
 cd /d "%~dp0"
 python -m pip install -r requirements.txt --quiet
-start "" pythonw mousebridge.py
+start "" pythonw mousync.py

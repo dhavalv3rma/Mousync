@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-MouseBridge - share one mouse & keyboard between two computers on the same network
+Mousync - share one mouse & keyboard between two computers on the same network
 (a small, self-hosted alternative to ShareMouse).
 
 How it works
-  * Run MouseBridge on both PCs with the same pairing code. They find each other on the
+  * Run Mousync on both PCs with the same pairing code. They find each other on the
     local network automatically (UDP broadcast); no IP address needed.
   * Push the cursor off the screen edge that faces the other PC. Your mouse and keyboard
     now control that PC. Push it back off the opposite edge to return.
@@ -52,12 +52,13 @@ try:
 except ImportError:  # clipboard sync is optional
     pyperclip = None
 
-APP = "MouseBridge"
+APP = "Mousync"
 VERSION = "1.1"
 DEFAULT_PORT = 24850
 DISCOVERY_PORT = 24851      # UDP, LAN broadcast beacons
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I/L
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".mousebridge.json")
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".mousync.json")
+OLD_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".mousebridge.json")  # pre-rename settings
 ASSET_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "assets")
 OSNAME = "win" if IS_WIN else ("mac" if sys.platform == "darwin" else "linux")
 
@@ -131,6 +132,7 @@ def clip_set(s):
 
 
 def derive_key(password):
+    # Salt kept from the app's original name: changing it would break pairing with older builds.
     return hashlib.pbkdf2_hmac("sha256", password.encode(), b"mousebridge-v1", 200_000)
 
 
@@ -300,7 +302,7 @@ class Bridge:
             self.log(f"Move the cursor off the {self.cfg['side'].upper()} edge to control the other PC. "
                      "Scroll Lock = emergency return.")
         else:
-            self.log("This PC can be controlled by a Windows PC running MouseBridge. "
+            self.log("This PC can be controlled by a Windows PC running Mousync. "
                      "(Controlling others from macOS/Linux is not supported yet.)")
 
     def stop(self):
@@ -460,7 +462,7 @@ class Bridge:
                 self.found = (addr[0], pport, pid, name, time.time())
             elif pid not in self.mismatch:
                 self.mismatch.add(pid)
-                self.log(f"Saw MouseBridge on {name} ({addr[0]}), but it uses a different pairing code")
+                self.log(f"Saw Mousync on {name} ({addr[0]}), but it uses a different pairing code")
 
     def _send_loop(self):
         while self.running:
@@ -660,11 +662,13 @@ class Bridge:
 # --------------------------------------------------------------------------- config
 def load_config():
     cfg = {"peer": "", "port": DEFAULT_PORT, "password": "", "side": "right", "clipboard": True}
-    try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            cfg.update(json.load(f))
-    except (OSError, ValueError):
-        pass
+    for path in (CONFIG_PATH, OLD_CONFIG_PATH):  # first one found wins
+        try:
+            with open(path, encoding="utf-8") as f:
+                cfg.update(json.load(f))
+            break
+        except (OSError, ValueError):
+            pass
     return cfg
 
 

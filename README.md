@@ -1,4 +1,4 @@
-# MouseBridge: share one mouse & keyboard between two PCs
+# Mousync: share one mouse & keyboard between two PCs
 
 A small ShareMouse-style app for your local network.
 
@@ -24,30 +24,30 @@ A small ShareMouse-style app for your local network.
 
 **If they don't find each other** (some routers block broadcast between Wi-Fi and wired, or "client isolation" is on), type the other PC's IP into *Other PC's IP* on one PC. That PC then connects directly. Also check that Windows lists the network as **Private**, not Public.
 
-Want a single `.exe` with no Python? Run `build_exe.bat` once, then copy `dist\MouseBridge.exe` to both PCs.
+Want a single `.exe` with no Python? Run `build_exe.bat` once, then copy `dist\Mousync.exe` to both PCs.
 
-Terminal mode: `python mousebridge.py --nogui --code K7MQ-2PXH --side right [--peer 192.168.1.20]` (omit `--code` to have one generated)
+Terminal mode: `python mousync.py --nogui --code K7MQ-2PXH --side right [--peer 192.168.1.20]` (omit `--code` to have one generated)
 
 ## Notes
 - **How auto-connect works:** each PC broadcasts a small beacon on UDP 24851 every second. The beacon has an HMAC proof made from the pairing code, never the code itself. A PC that sees a beacon with a matching proof connects to it.
-- **Admin windows:** to control windows running as administrator (Task Manager, installers), run MouseBridge as administrator. Windows blocks input into elevated apps otherwise.
+- **Admin windows:** to control windows running as administrator (Task Manager, installers), run Mousync as administrator. Windows blocks input into elevated apps otherwise.
 - **Ctrl+Alt+Del** can't be forwarded. Windows reserves it.
 - **macOS/Linux:** these can be *controlled* by a Windows PC. On macOS, allow the app under System Settings → Privacy & Security → Accessibility (and Input Monitoring). Controlling from a Mac is not built yet.
 - **Mac keyboard mapping:** the Windows key acts as Cmd on a Mac.
 - **While controlling:** the local cursor sits parked in the middle of your screen.
-- Settings are saved to `~/.mousebridge.json`.
+- Settings are saved to `~/.mousync.json`.
 
-## Building the installers (MouseBridge-Setup.exe + MouseBridge.dmg)
+## Building the installers (Mousync-Setup.exe + Mousync.dmg)
 GitHub Actions builds both installers for you, on GitHub's Windows and Mac machines:
 
 ```sh
-cd mousebridge
-git init && git add . && git commit -m "MouseBridge 1.0"
-gh repo create mousebridge --private --source . --push
+cd mousync
+git init && git add . && git commit -m "Mousync 1.0"
+gh repo create mousync --private --source . --push
 git tag v1.0 && git push origin v1.0
 ```
 After about 5 minutes, both files appear under the repo's **Releases** page. You can also start a build by hand from **Actions → Build installers → Run workflow**; the files then appear under that run's *Artifacts*.
 
-- **Windows installer:** installs to Program Files and adds Start-menu and desktop shortcuts. It can optionally start MouseBridge with Windows, and it opens firewall ports TCP 24850 and UDP 24851 (discovery) for private networks. Uninstalling removes everything, including the firewall rule.
-- **Mac DMG:** drag MouseBridge to Applications. The app is unsigned, so the first time, right-click it and choose **Open**. Then allow it under System Settings → Privacy & Security → **Accessibility** and **Input Monitoring**. This build is for Apple Silicon (M1/M2/M3/M4) Macs.
+- **Windows installer:** installs to Program Files and adds Start-menu and desktop shortcuts. It can optionally start Mousync with Windows, and it opens firewall ports TCP 24850 and UDP 24851 (discovery) for private networks. Uninstalling removes everything, including the firewall rule.
+- **Mac DMG:** drag Mousync to Applications. The app is unsigned, so the first time, right-click it and choose **Open**. Then allow it under System Settings → Privacy & Security → **Accessibility** and **Input Monitoring**. This build is for Apple Silicon (M1/M2/M3/M4) Macs.
 - **Windows SmartScreen** may say "Windows protected your PC" because the exe is unsigned. Click **More info → Run anyway**.
