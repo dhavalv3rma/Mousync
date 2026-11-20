@@ -1,0 +1,69 @@
+name: Build installers
+
+on:
+  push:
+    tags: ["v*"]        # push a tag like v1.0 to build + publish a release
+  workflow_dispatch:     # or run it by hand from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+      - name: Build MouseBridge.exe
+        run: pyinstaller --noconfirm --onefile --windowed --name MouseBridge mousebridge.py
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+      - name: Build installer
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\windows.iss'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MouseBridge-Windows
+          path: Output/MouseBridge-Setup.exe
+
+  macos:
+    runs-on: macos-14   # Apple Silicon (M1/M2/M3/M4)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+      - name: Build MouseBridge.app
+        run: |
+          pyinstaller --noconfirm --windowed --name MouseBridge \
+            --osx-bundle-identifier in.dhavalverma.mousebridge mousebridge.py
+          codesign --force --deep --sign - dist/MouseBridge.app
+      - name: Build DMG
+        run: |
+          mkdir dmg
+          cp -R dist/MouseBridge.app dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname MouseBridge -srcfolder dmg -ov -format UDZO MouseBridge.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MouseBridge-macOS
+          path: MouseBridge.dmg
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/MouseBridge-Windows/MouseBridge-Setup.exe
+            out/MouseBridge-macOS/MouseBridge.dmg
