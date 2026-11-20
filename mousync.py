@@ -16,7 +16,6 @@ How it works
 Platform support
   * Windows and macOS : can control the other PC AND be controlled by it.
   * Linux             : can be controlled.
-  * Tick "Primary controller" on one PC to make it the only one that can control.
 """
 import argparse
 import ctypes
@@ -56,12 +55,23 @@ try:
 except ImportError:  # clipboard sync is optional
     pyperclip = None
 
-Quartz = AppKit = None
+Quartz = AppKit = HIServices = None
 if IS_MAC:  # pyobjc ships with pynput / pystray on macOS
     try:
         import Quartz
-    except ImportError:
-        pass
+        import HIServices
+        # pyobjc resolves functions lazily, and that isn't safe when two threads race to do it first.
+        # Touch everything the background threads use now, on the main thread.
+        for _name in ("CGEventTapCreate", "CGEventTapEnable", "CGEventMaskBit", "CFMachPortCreateRunLoopSource",
+                      "CFRunLoopGetCurrent", "CFRunLoopAddSource", "CFRunLoopRun", "CFRunLoopStop",
+                      "CGEventGetIntegerValueField", "CGEventGetDoubleValueField", "CGEventGetLocation",
+                      "CGEventGetFlags", "CGWarpMouseCursorPosition", "CGAssociateMouseAndMouseCursorPosition",
+                      "CGGetActiveDisplayList", "CGDisplayBounds"):
+            getattr(Quartz, _name)
+        for _name in ("AXIsProcessTrusted", "AXIsProcessTrustedWithOptions"):
+            getattr(HIServices, _name)
+    except (ImportError, AttributeError, KeyError):
+        Quartz = None
     try:
         import AppKit
     except ImportError:
@@ -83,6 +93,13 @@ ASSET_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspat
 OSNAME = "win" if IS_WIN else ("mac" if IS_MAC else "linux")
 
 LOCAL, REMOTE, CONTROLLED = "local", "remote", "controlled"
+OS_LABEL = {"win": "Windows", "mac": "macOS", "linux": "Linux"}
+
+
+def device_label(os_code, name):
+    """How a computer is shown everywhere: 'macOS (XD.local)'."""
+    osn = OS_LABEL.get(os_code)
+    return f"{osn} ({name})" if osn else str(name)
 OPP = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
 
 # --------------------------------------------------------------------------- helpers
@@ -117,7 +134,8 @@ def warp_cursor(x, y):
 
 
 def mac_lock_cursor(locked):
-    """While controlling the other PC, freeze the Mac cursor but keep receiving mouse deltas."""
+    """While controlling the other PC, freeze the Mac cursor where it is but keep receiving mouse deltas.
+    Unlocking also cancels the ~0.25 s pause macOS puts on real mouse input after a cursor warp."""
     if IS_MAC and Quartz is not None:
         Quartz.CGAssociateMouseAndMouseCursorPosition(not locked)
 
@@ -506,6 +524,82 @@ class Channel:
             pass
 
 
+# --------------------------------------------------------------------------- macOS input capture
+class MacEventTap:
+    """One Quartz event tap for mouse + keyboard, on its own thread.
+
+    We don't use pynput's macOS listeners: its keyboard listener asks the system for the keyboard
+    layout from a background thread, and recent macOS kills the app for that (dispatch_assert_queue).
+    We only need raw key codes, so a plain tap is enough. handler(type, event) returns the event to
+    let it through or None to swallow it.
+    """
+    MOUSE_TYPES = ("kCGEventMouseMoved", "kCGEventLeftMouseDown", "kCGEventLeftMouseUp",
+                   "kCGEventRightMouseDown", "kCGEventRightMouseUp", "kCGEventOtherMouseDown",
+                   "kCGEventOtherMouseUp", "kCGEventLeftMouseDragged", "kCGEventRightMouseDragged",
+                   "kCGEventOtherMouseDragged", "kCGEventScrollWheel")
+    KEY_TYPES = ("kCGEventKeyDown", "kCGEventKeyUp", "kCGEventFlagsChanged")
+    NX_SYSDEFINED = 14  # media / brightness keys
+
+    def __init__(self, on_mouse, on_key):
+        Q = Quartz
+        self.on_mouse, self.on_key = on_mouse, on_key
+        self.key_types = {getattr(Q, n) for n in self.KEY_TYPES} | {self.NX_SYSDEFINED}
+        self.mask = 0
+        for n in self.MOUSE_TYPES + self.KEY_TYPES:
+            self.mask |= Q.CGEventMaskBit(getattr(Q, n))
+        self.mask |= Q.CGEventMaskBit(self.NX_SYSDEFINED)
+        self.tap = self.loop = None
+        self.ok = False
+        self.ready = threading.Event()
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+        self.ready.wait(3)
+        return self.ok
+
+    def _callback(self, proxy, etype, event, refcon):
+        Q = Quartz
+        if etype in (Q.kCGEventTapDisabledByTimeout, Q.kCGEventTapDisabledByUserInput):
+            Q.CGEventTapEnable(self.tap, True)  # macOS switched us off (slow callback): switch back on
+            return event
+        try:
+            return (self.on_key if etype in self.key_types else self.on_mouse)(etype, event)
+        except Exception:
+            return event                         # never eat input because of a bug in a handler
+
+    def _run(self):
+        Q = Quartz
+        try:
+            self.tap = Q.CGEventTapCreate(Q.kCGSessionEventTap, Q.kCGHeadInsertEventTap,
+                                          Q.kCGEventTapOptionDefault, self.mask, self._callback, None)
+            if self.tap is None:                 # no Accessibility permission
+                return
+            src = Q.CFMachPortCreateRunLoopSource(None, self.tap, 0)
+            self.loop = Q.CFRunLoopGetCurrent()
+            Q.CFRunLoopAddSource(self.loop, src, Q.kCFRunLoopCommonModes)
+            Q.CGEventTapEnable(self.tap, True)
+            self.ok = True
+        finally:
+            self.ready.set()
+        Q.CFRunLoopRun()
+
+    def stop(self):
+        if self.tap is not None:
+            Quartz.CGEventTapEnable(self.tap, False)
+        if self.loop is not None:
+            Quartz.CFRunLoopStop(self.loop)
+
+
+def mac_trusted(prompt=False):
+    """Has the user allowed Mousync under Accessibility? prompt=True shows macOS's own dialog."""
+    try:
+        if prompt:
+            return bool(HIServices.AXIsProcessTrustedWithOptions({HIServices.kAXTrustedCheckOptionPrompt: True}))
+        return bool(HIServices.AXIsProcessTrusted())
+    except Exception:
+        return True
+
+
 # --------------------------------------------------------------------------- Windows hook constants
 WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOUSEHWHEEL = 0x0200, 0x020A, 0x020E
 WM_BUTTONS = {0x0201: ("left", True), 0x0202: ("left", False),
@@ -540,7 +634,8 @@ class Bridge:
         self.ctrl_from = "left"
         self.peer_os = None
         self.peer_name = None
-        self.peer_primary = False
+        self.enter_t = 0.0
+        self.warned_refused = False
         self.last_clip = None    # last clipboard text sent or received (prevents echo loops)
         self.clip_mark = None
         self.last_files = ()     # last file list copied here or received (prevents echo loops)
@@ -553,7 +648,9 @@ class Bridge:
         self.held_btn = set()
         self.scroll_acc = [0.0, 0.0]
         self.lsock = None
-        self.ml = self.kl = None
+        self.ml = self.kl = self.tap = None
+        # Create these on the main thread: on macOS the keyboard controller reads the keyboard layout,
+        # which must not happen on a background thread.
         self.mctl = mouse.Controller()
         self.kctl = keyboard.Controller()
 
@@ -570,22 +667,28 @@ class Bridge:
         if self.auto:
             threading.Thread(target=self._disc_loop, daemon=True).start()
         threading.Thread(target=self._clip_loop, daemon=True).start()
+        capturing = False
         if IS_WIN:
             self.ml = mouse.Listener(win32_event_filter=self._mfilter)
             self.kl = keyboard.Listener(win32_event_filter=self._kfilter)
-        elif CAN_CONTROL:  # macOS
-            self.ml = mouse.Listener(darwin_intercept=self._mac_mouse)
-            self.kl = keyboard.Listener(darwin_intercept=self._mac_key)
-        if self.ml:
             self.ml.start()
             self.kl.start()
-            if IS_MAC and not getattr(self.ml, "IS_TRUSTED", True):
-                self.log("macOS has not allowed Mousync to use the mouse and keyboard yet. Allow it under "
-                         "System Settings > Privacy & Security > Accessibility and Input Monitoring, then restart it.")
+            capturing = True
+        elif CAN_CONTROL:  # macOS
+            trusted = mac_trusted(prompt=True)   # first run: macOS shows its "allow" dialog
+            self.tap = MacEventTap(self._mac_mouse, self._mac_key)
+            capturing = self.tap.start()
+            if not capturing:
+                self.tap = None
+                self.log("macOS hasn't allowed Mousync to use the mouse and keyboard"
+                         + (" yet" if not trusted else "") + ", so this Mac can't control or be controlled. "
+                         "Allow Mousync under System Settings > Privacy & Security > Accessibility "
+                         "(and Input Monitoring), then press Stop and Start.")
+        if capturing:
             esc = "Esc x3 or Scroll Lock" if IS_WIN else "Esc x3"
             self.log(f"Move the cursor off the {self.cfg['side'].upper()} edge to control the other PC. "
                      f"Emergency return: {esc}.")
-        else:
+        elif not IS_MAC:
             self.log("This PC can be controlled by the other PC (controlling from Linux is not supported).")
 
     def stop(self):
@@ -598,7 +701,7 @@ class Bridge:
             self.state = LOCAL
         self.tx_id = None
         self._rx_abort()
-        for l in (self.ml, self.kl):
+        for l in (self.ml, self.kl, self.tap):
             if l:
                 l.stop()
         if self.chan:
@@ -666,13 +769,11 @@ class Bridge:
                     continue
                 chan = Channel(sock, self.key)
                 chan.send({"t": "hello", "name": socket.gethostname(), "os": OSNAME, "v": VERSION,
-                           "primary": bool(self.cfg.get("primary")), "can_control": CAN_CONTROL,
-                           "files": True})
+                           "can_control": CAN_CONTROL, "files": True})
                 hello = chan.recv()
                 if hello.get("t") != "hello":
                     raise ConnectionError("bad handshake")
                 self.peer_os, self.peer_name = hello.get("os"), hello.get("name", "?")
-                self.peer_primary = bool(hello.get("primary"))
                 self.peer_files = bool(hello.get("files"))
                 # sync new copies only, not whatever was already on the clipboard
                 self.last_clip, self.clip_mark = clip_get(), clip_seq()
@@ -680,8 +781,10 @@ class Bridge:
                 with self.out.mutex:
                     self.out.queue.clear()
                 self.chan = chan
-                self.status(f"Connected to {self.peer_name} ({self.peer_os})")
-                self.log(f"Connected to {self.peer_name}. {self.role_text()}")
+                self.status(f"Connected to {self.peer_label}")
+                both = CAN_CONTROL and hello.get("can_control", True)
+                self.log(f"Connected to {self.peer_label}."
+                         + (" Either PC can control the other." if both else ""))
                 while self.running:
                     self._handle(chan.recv())
             except InvalidTag:
@@ -728,7 +831,7 @@ class Bridge:
             self.log(f"Auto-discovery unavailable ({e}). Enter the other PC's IP instead.")
             return
         beacon = json.dumps({"app": APP, "v": 1, "id": self.node_id, "port": port,
-                             "name": socket.gethostname(),
+                             "name": socket.gethostname(), "os": OSNAME,
                              "tag": beacon_tag(self.key, self.node_id, port)}).encode()
         next_tx = 0.0
         while self.running:
@@ -751,46 +854,21 @@ class Bridge:
                 if not self.running:
                     break
                 continue
-            name = str(m.get("name", addr[0]))[:64]
+            name = device_label(str(m.get("os", ""))[:8], str(m.get("name", addr[0]))[:64])
             if hmac.compare_digest(str(m.get("tag", "")), beacon_tag(self.key, pid, pport)):
                 if not self.found or self.found[2] != pid:
-                    self.log(f"Found {name} ({addr[0]}) with the same pairing code")
+                    self.log(f"Found {name} at {addr[0]} with the same pairing code")
                 self.found = (addr[0], pport, pid, name, time.time())
             elif pid not in self.mismatch:
                 self.mismatch.add(pid)
-                self.log(f"Saw Mousync on {name} ({addr[0]}), but it uses a different pairing code")
-
-    # ---- who may control whom
-    def can_control(self):
-        return CAN_CONTROL and (bool(self.cfg.get("primary")) or not self.peer_primary)
-
-    def role_text(self):
-        me, peer, name = bool(self.cfg.get("primary")), self.peer_primary, self.peer_name or "the other PC"
-        if me and peer:
-            return "Both PCs are ticked as primary, so either can control the other."
-        if me:
-            return f"This PC is the primary controller: {name} can't control it."
-        if peer:
-            return f"{name} is the primary controller: this PC can't control it."
-        return "Either PC can control the other."
-
-    def set_primary(self, primary):
-        self.cfg["primary"] = bool(primary)
-        self.send({"t": "role", "primary": bool(primary)})
-        self._apply_role()
-
-    def _apply_role(self):
-        if self.chan is not None:
-            self.log(self.role_text())
-        with self.lock:
-            if self.state == REMOTE and not self.can_control():
-                self._go_local(0.5, notify=True)
+                self.log(f"Saw Mousync on {name} at {addr[0]}, but it uses a different pairing code")
 
     # ---- clipboard: sync every new copy, both ways
     def _clip_loop(self):
         while self.running:
             time.sleep(0.4)
-            if self.chan is None or not self.cfg.get("clipboard", True):
+            share_text, share_files = self.cfg.get("clipboard", True), self.cfg.get("share_files", True)
+            if self.chan is None or not (share_text or share_files):
                 continue
             mark = clip_seq()
             if mark is not None and mark == self.clip_mark:
@@ -801,8 +879,10 @@ class Bridge:
                 if tuple(files) != self.last_files:
                     self.last_files = tuple(files)
                     self.last_clip = clip_get()  # Finder also puts the names as text: don't send those
-                    if self.peer_files:
+                    if self.peer_files and share_files:
                         self.send_files(files, "clip")
+                continue
+            if not share_text:
                 continue
             text = clip_get()
             if not text or text == self.last_clip:
@@ -810,15 +890,19 @@ class Bridge:
             self.last_clip = text
             self.send({"t": "clip", "text": text})
 
+    @property
+    def peer_label(self):
+        return device_label(self.peer_os, self.peer_name) if self.peer_name else "the other PC"
+
     def base_status(self):
-        peer = self.peer_name
+        peer = self.peer_label
         if self.chan is None:
             return "Not connected"
         if self.state == REMOTE:
             return f"Controlling {peer}  (Esc x3 = come back)"
         if self.state == CONTROLLED:
             return f"Controlled by {peer}"
-        return f"Connected to {peer} ({self.peer_os})"
+        return f"Connected to {peer}"
 
     # ---- files: sending
     def send_files(self, paths, mode="send"):
@@ -831,7 +915,7 @@ class Bridge:
             self.log("Not connected, so the files were not sent.")
             return
         if not self.peer_files:
-            self.log(f"{self.peer_name} runs an older Mousync without file sharing. Update it to share files.")
+            self.log(f"{self.peer_label} runs an older Mousync without file sharing. Update it to share files.")
             return
         try:
             files, dirs, total = gather_files(paths)
@@ -875,7 +959,7 @@ class Bridge:
                             self.status(f"Sending {what}: {100 * sent // max(total, 1)}%")
             chan.send({"t": "fend", "id": tid})
             secs = max(time.time() - start, 0.001)
-            self.log(f"Sent {what} ({fmt_size(total)}) to {self.peer_name}"
+            self.log(f"Sent {what} ({fmt_size(total)}) to {self.peer_label}"
                      + (f" at {fmt_size(total / secs)}/s" if total > 5_000_000 else "")
                      + (". Paste it there." if mode == "clip" else "."))
         except InterruptedError:
@@ -897,6 +981,10 @@ class Bridge:
     # ---- files: receiving
     def _rx_start(self, m):
         self._rx_abort()                      # a newer transfer replaces an unfinished one
+        if not self.cfg.get("share_files", True):
+            self.send({"t": "fabort", "id": m.get("id")})
+            self.log(f"Declined files from {self.peer_label}: file sharing is off on this computer.")
+            return
         mode = "send" if m.get("mode") == "send" else "clip"
         base = RECEIVE_DIR if mode == "send" else CLIP_CACHE
         tid = str(m.get("id", ""))[:16]
@@ -963,7 +1051,7 @@ class Bridge:
             return
         if time.time() - rx["shown"] > 0.5:
             rx["shown"] = time.time()
-            self.status(f"Receiving from {self.peer_name}: {100 * rx['got'] // max(rx['total'], 1)}%")
+            self.status(f"Receiving from {self.peer_label}: {100 * rx['got'] // max(rx['total'], 1)}%")
 
     def _rx_end(self, m):
         rx = self.rx
@@ -995,7 +1083,7 @@ class Bridge:
             self.last_files = tuple(final)
             self.clip_mark = clip_seq()
         paste = "Cmd+V" if IS_MAC else "Ctrl+V"
-        msg = f"Received {what} ({fmt_size(rx['total'])}) from {self.peer_name}."
+        msg = f"Received {what} ({fmt_size(rx['total'])}) from {self.peer_label}."
         msg += f" Saved in {where}." if where else f" Paste it with {paste} in a folder."
         self.log(msg)
         self.status(self.base_status())
@@ -1062,18 +1150,16 @@ class Bridge:
             self._rx_end(m)
             return
         if t == "fabort":
-            if self.rx and self.rx["id"] == m.get("id"):
+            if self.rx and self.rx["id"] == m.get("id"):      # sender cancelled
                 self._rx_abort()
                 self.status(self.base_status())
+            elif self.tx_id and self.tx_id == m.get("id"):    # receiver declined
+                self.tx_id = None
+                self.log(f"{self.peer_label} has file sharing turned off, so the files were not sent.")
             return
-        if t == "role":
-            self.peer_primary = bool(m.get("primary"))
-            self._apply_role()
+        if t == "role":           # from builds that had "Primary controller": no longer used
             return
         if t == "enter":
-            if self.cfg.get("primary") and not self.peer_primary:   # we are the only controller
-                self.send({"t": "leave", "ratio": m.get("ratio", 0.5)})
-                return
             with self.lock:
                 if self.state == REMOTE:          # both crossed at once: yield
                     self._go_local(0.5)
@@ -1083,9 +1169,14 @@ class Bridge:
             if m.get("clip") is not None and self.cfg.get("clipboard", True):  # from 1.0 peers
                 clip_set(m["clip"])
             self.mctl.position = edge_point(self.ctrl_from, m.get("ratio", 0.5), 2)
-            self.status(f"Controlled by {self.peer_name}")
+            self.status(f"Controlled by {self.peer_label}")
             return
         if t == "leave":
+            if (self.state == REMOTE and time.time() - self.enter_t < 0.3
+                    and not self.warned_refused):  # sent straight back: an older build refusing control
+                self.warned_refused = True
+                self.log(f"{self.peer_label} sent control straight back. If it runs an older Mousync with "
+                         "'Primary controller' ticked, untick it there or update it to this version.")
             if m.get("clip") is not None and self.cfg.get("clipboard", True):
                 clip_set(m["clip"])
             with self.lock:
@@ -1148,7 +1239,7 @@ class Bridge:
                 self._release_playback()
                 self.state = LOCAL
             self.send({"t": "leave", "ratio": ratio})
-            self.status(f"Connected to {self.peer_name}")
+            self.status(self.base_status())
 
     def _release_playback(self):
         for k in list(self.held):
@@ -1167,30 +1258,36 @@ class Bridge:
     # ---- controlling the peer (Windows low-level hooks)
     def _enter_remote(self, x, y):
         with self.lock:
-            if (self.state != LOCAL or self.chan is None or time.time() < self.cooldown
-                    or not self.can_control()):
+            if self.state != LOCAL or self.chan is None or time.time() < self.cooldown or not CAN_CONTROL:
                 return False
             side = self.cfg["side"]
             ratio = edge_ratio(side, x, y)
-            l, t, r, b = screen_bounds()
-            self.park = ((l + r) // 2, (t + b) // 2)
-            warp_cursor(*self.park)
-            mac_lock_cursor(True)
+            if IS_MAC:
+                # Freeze the cursor right where it crossed. No warp: a warp makes macOS ignore
+                # real trackpad/mouse input for ~0.25 s, and the Mac still reports movement anyway.
+                self.park = (x, y)
+                mac_lock_cursor(True)
+            else:
+                # Windows: park in the middle and measure how far each move pushes away from it.
+                l, t, r, b = screen_bounds()
+                self.park = ((l + r) // 2, (t + b) // 2)
+                warp_cursor(*self.park)
             self.esc_times = []
+            self.enter_t = time.time()
             self.state = REMOTE
         self.send({"t": "enter", "from": OPP[side], "ratio": ratio})
-        self.status(f"Controlling {self.peer_name}  (Esc x3 = come back)")
+        self.status(f"Controlling {self.peer_label}  (Esc x3 = come back)")
         return True
 
     def _go_local(self, ratio, notify=False):
         """Call with self.lock held."""
         self.state = LOCAL
         self.cooldown = time.time() + 0.4
-        mac_lock_cursor(False)
         warp_cursor(*edge_point(self.cfg["side"], ratio, 6))
+        mac_lock_cursor(False)   # after the warp: also lifts macOS's post-warp input pause
         if notify:
             self.send({"t": "release"})
-        self.status(f"Connected to {self.peer_name}" if self.chan else "Not connected")
+        self.status(self.base_status())
 
     def _hit_edge(self, x, y):
         l, t, r, b = screen_bounds()
@@ -1216,7 +1313,7 @@ class Bridge:
         if self.state == REMOTE:
             self._forward_mouse(msg, data)
             self.ml.suppress_event()
-        elif self.state == LOCAL and msg == WM_MOUSEMOVE and self.chan is not None and self.can_control():
+        elif self.state == LOCAL and msg == WM_MOUSEMOVE and self.chan is not None:
             if self._hit_edge(data.pt.x, data.pt.y) and self._enter_remote(data.pt.x, data.pt.y):
                 self.ml.suppress_event()
         return False
@@ -1267,8 +1364,7 @@ class Bridge:
         if self.state == REMOTE:
             self._mac_forward_mouse(etype, event)
             return None                       # swallow it: this input belongs to the other PC
-        if (self.state == LOCAL and etype == Q.kCGEventMouseMoved and self.chan is not None
-                and self.can_control()):
+        if self.state == LOCAL and etype == Q.kCGEventMouseMoved and self.chan is not None:
             p = Q.CGEventGetLocation(event)
             if self._hit_edge(p.x, p.y) and self._enter_remote(p.x, p.y):
                 return None
@@ -1328,7 +1424,7 @@ class Bridge:
 # --------------------------------------------------------------------------- config
 def load_config():
     cfg = {"peer": "", "port": DEFAULT_PORT, "password": "", "side": "right", "clipboard": True,
-           "primary": False}
+           "share_files": True, "theme": "system"}
     for path in (CONFIG_PATH, OLD_CONFIG_PATH):  # first one found wins
         try:
             with open(path, encoding="utf-8") as f:
@@ -1393,126 +1489,377 @@ def make_tray(menu_items, title):
 
 
 # --------------------------------------------------------------------------- GUI
+# The window is drawn entirely by Mousync (rounded cards, switches, icons) instead of using each
+# OS's native widgets, so it looks the same on Windows and macOS, in dark and light mode.
+THEMES = {
+    "dark": dict(bg="#111117", card="#1A1A23", tile="#24242F", border="#2B2B38", text="#F3F3F8",
+                 muted="#9B9BAF", accent="#7B5CFF", accent_hover="#8C70FF", accent_soft="#2A2350",
+                 on_accent="#FFFFFF", green="#3DDC84", green_bg="#14301F", blue="#5AA9FF",
+                 blue_bg="#152639", amber="#F5B544", grey="#6E6E80", switch_off="#3A3A4A",
+                 knob="#FFFFFF", field="#14141B", log="#14141B"),
+    "light": dict(bg="#F3F3F8", card="#FFFFFF", tile="#F0EFF7", border="#E1E0EB", text="#16161E",
+                  muted="#6B6B7F", accent="#6A47FF", accent_hover="#7A5BFF", accent_soft="#EEE9FF",
+                  on_accent="#FFFFFF", green="#15A256", green_bg="#E2F5E9", blue="#2F7DE1",
+                  blue_bg="#E3EEFB", amber="#C98000", grey="#A3A3B3", switch_off="#D4D3DF",
+                  knob="#FFFFFF", field="#F7F7FB", log="#F7F7FB"),
+}
+
+
+def system_theme():
+    try:
+        if IS_MAC and AppKit is not None:
+            style = AppKit.NSUserDefaults.standardUserDefaults().stringForKey_("AppleInterfaceStyle")
+            return "dark" if style and str(style).lower() == "dark" else "light"
+        if IS_WIN:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+                return "light" if winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 1 else "dark"
+    except Exception:
+        pass
+    return "dark"
+
+
+def match_title_bar(root, theme):
+    """Make the OS title bar follow the app theme."""
+    try:
+        if IS_MAC and AppKit is not None:
+            name = AppKit.NSAppearanceNameDarkAqua if theme == "dark" else AppKit.NSAppearanceNameAqua
+            AppKit.NSApplication.sharedApplication().setAppearance_(AppKit.NSAppearance.appearanceNamed_(name))
+        elif IS_WIN:
+            hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+            on = ctypes.c_int(1 if theme == "dark" else 0)
+            for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (newer, older Windows 10)
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(on), 4) == 0:
+                    break
+    except Exception:
+        pass
+
+
+def status_view(s):
+    """Status text from the bridge -> (dot colour key, title, subtitle)."""
+    if s.startswith("Controlling "):
+        return "accent", "Controlling", s[len("Controlling "):].split("  (")[0] + "  ·  Esc ×3 to come back"
+    if s.startswith("Controlled by "):
+        return "accent", "Being controlled", "by " + s[len("Controlled by "):]
+    if s.startswith("Connected to "):
+        return "green", "Connected", s[len("Connected to "):]
+    if s.startswith(("Sending", "Receiving")):
+        return "blue", s.split(":")[0], s.split(":", 1)[1].strip() if ":" in s else ""
+    if s.startswith("Searching"):
+        return "amber", "Searching…", "Looking for the other computer on your network"
+    if s.startswith(("Found", "Connecting")):
+        return "amber", "Connecting…", s.split(",")[0]
+    if s.startswith("Not connected"):
+        return "grey", "Not connected", "Waiting for the other computer"
+    if s.startswith("Stopped"):
+        return "grey", "Stopped", "Not sharing yet"
+    return "grey", s, ""
+
+
 def run_gui():
     import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    import tkinter.font as tkfont
+    from tkinter import filedialog, messagebox
 
     cfg = load_config()
     root = tk.Tk()
     root.title(f"{APP} {VERSION}")
     root.resizable(False, False)
     try:
-        root.iconphoto(True, tk.PhotoImage(file=os.path.join(ASSET_DIR, "icon.png")))
+        app_icon = tk.PhotoImage(file=os.path.join(ASSET_DIR, "icon.png"))
+        root.iconphoto(True, app_icon)
     except Exception:
-        pass  # running without the assets folder: keep the default icon
+        app_icon = None  # running without the assets folder: keep the default icon
     set_fallback_bounds(root.winfo_screenwidth(), root.winfo_screenheight())
     events = queue.Queue()
-    state = {"bridge": None}
 
-    frm = ttk.Frame(root, padding=12)
-    frm.grid()
-    ttk.Label(frm, text=f"This PC: {socket.gethostname()}   IP: {local_ip()}",
-              font=("Segoe UI", 10, "bold")).grid(column=0, row=0, columnspan=4, sticky="w", pady=(0, 8))
+    # Same physical size everywhere: Tk on Windows works in real pixels (the app is DPI-aware),
+    # on macOS in points. S scales every size; fonts use pixel sizes so they scale identically.
+    scale = {"S": 1.0 if IS_MAC else max(1.0, root.winfo_fpixels("1i") / 96.0)}
 
-    ttk.Label(frm, text="Pairing code:").grid(column=0, row=1, sticky="w")
-    pw_v = tk.StringVar(value=cfg["password"] or new_pairing_code())
-    ttk.Entry(frm, textvariable=pw_v, width=22, font=("Consolas", 11)).grid(column=1, row=1, sticky="w")
-    ttk.Button(frm, text="New code", command=lambda: pw_v.set(new_pairing_code())).grid(
-        column=2, row=1, sticky="w", padx=6)
-    ttk.Label(frm, text="Type the same code on the other PC. It is found automatically.",
-              foreground="#666").grid(column=0, row=2, columnspan=4, sticky="w")
+    def px(n):
+        return int(round(n * scale["S"]))
 
-    ttk.Label(frm, text="Other PC's IP:").grid(column=0, row=3, sticky="w", pady=(6, 0))
-    peer_v = tk.StringVar(value=cfg["peer"])
-    ttk.Entry(frm, textvariable=peer_v, width=22).grid(column=1, row=3, sticky="w", pady=(6, 0))
-    ttk.Label(frm, text="(optional: only if auto-find fails)", foreground="#666").grid(
-        column=2, row=3, columnspan=2, sticky="w", padx=6, pady=(6, 0))
+    family = tkfont.nametofont("TkDefaultFont").actual("family") if IS_MAC else "Segoe UI"
+    mono = "Menlo" if IS_MAC else "Consolas"
 
-    ttk.Label(frm, text="Port:").grid(column=0, row=4, sticky="w")
-    port_v = tk.StringVar(value=str(cfg["port"]))
-    ttk.Entry(frm, textvariable=port_v, width=8).grid(column=1, row=4, sticky="w")
+    def F(size, weight="normal", fam=None):
+        return (fam or family, -px(size), weight)
 
-    ttk.Label(frm, text="Other PC is on my:").grid(column=0, row=5, sticky="w", pady=(6, 0))
-    side_v = tk.StringVar(value=cfg["side"])
-    sf = ttk.Frame(frm)
-    sf.grid(column=1, row=5, columnspan=3, sticky="w", pady=(6, 0))
-    for s in ("left", "right", "top", "bottom"):
-        ttk.Radiobutton(sf, text=s.capitalize(), value=s, variable=side_v).pack(side="left", padx=2)
-
+    saved = normalize_code(cfg.get("password") or "")
+    state = {
+        "bridge": None, "status": "Stopped", "log_lines": [], "log_open": False,
+        "theme": cfg.get("theme") if cfg.get("theme") in THEMES else system_theme(),
+        "code": saved if len(saved) == 9 and saved[4] == "-" else new_pairing_code(),
+    }
+    peer_v = tk.StringVar(value=cfg.get("peer", ""))
+    port_v = tk.StringVar(value=str(cfg.get("port", DEFAULT_PORT)))
+    side_v = tk.StringVar(value=cfg.get("side", "right"))
     clip_v = tk.BooleanVar(value=cfg.get("clipboard", True))
-    ttk.Checkbutton(frm, text="Share clipboard both ways (text and copied files)", variable=clip_v).grid(
-        column=0, row=6, columnspan=4, sticky="w", pady=(4, 0))
+    files_v = tk.BooleanVar(value=cfg.get("share_files", True))
+    w = {}  # widgets of the current build, rebuilt on theme change
 
-    prim_v = tk.BooleanVar(value=cfg.get("primary", False))
+    # ---------------------------------------------------------------- drawing kit
+    def rrect(c, x1, y1, x2, y2, r, **kw):
+        r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2, x2 - r, y2,
+               x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+        return c.create_polygon(pts, smooth=True, splinesteps=16, **kw)
 
-    def on_primary():  # applies at once, even while connected
-        cfg["primary"] = prim_v.get()
-        save_config(cfg)
-        if state["bridge"]:
-            state["bridge"].set_primary(prim_v.get())
+    def icon(c, kind, cx, cy, s, col, bg):
+        lw = max(1.5, s / 11)
+        L = dict(fill=col, width=lw, capstyle="round", joinstyle="round")
+        O = dict(outline=col, width=lw, fill="")
+        h = s / 2
+        if kind == "monitor":
+            rrect(c, cx - h, cy - s * .38, cx + h, cy + s * .2, s * .12, **O)
+            c.create_line(cx, cy + s * .2, cx, cy + s * .36, **L)
+            c.create_line(cx - s * .22, cy + s * .38, cx + s * .22, cy + s * .38, **L)
+        elif kind == "laptop":
+            rrect(c, cx - s * .38, cy - s * .32, cx + s * .38, cy + s * .14, s * .08, **O)
+            c.create_line(cx - h, cy + s * .3, cx + h, cy + s * .3, **L)
+        elif kind == "key":
+            r = s * .2
+            c.create_oval(cx - s * .38, cy - s * .38, cx - s * .38 + 2 * r, cy - s * .38 + 2 * r, **O)
+            c.create_line(cx - s * .1, cy - s * .1, cx + s * .38, cy + s * .38, **L)
+            c.create_line(cx + s * .2, cy + s * .2, cx + s * .08, cy + s * .32, **L)
+            c.create_line(cx + s * .3, cy + s * .3, cx + s * .2, cy + s * .4, **L)
+        elif kind == "copy":
+            rrect(c, cx - s * .16, cy - s * .38, cx + s * .36, cy + s * .2, s * .08, **O)
+            rrect(c, cx - s * .36, cy - s * .18, cx + s * .16, cy + s * .4, s * .08, outline=col, width=lw, fill=bg)
+        elif kind == "refresh":
+            c.create_arc(cx - s * .36, cy - s * .36, cx + s * .36, cy + s * .36, start=60, extent=290,
+                         style="arc", outline=col, width=lw)
+            ax, ay = cx + s * .18, cy - s * .31
+            c.create_polygon(ax - s * .02, ay - s * .16, ax + s * .2, ay + s * .02, ax - s * .06, ay + s * .12,
+                             fill=col, outline=col)
+        elif kind == "check":
+            c.create_line(cx - s * .32, cy, cx - s * .08, cy + s * .24, cx + s * .34, cy - s * .24, **L)
+        elif kind == "clipboard":
+            rrect(c, cx - s * .32, cy - s * .32, cx + s * .32, cy + s * .42, s * .08, **O)
+            rrect(c, cx - s * .14, cy - s * .44, cx + s * .14, cy - s * .24, s * .05, outline=col, width=lw, fill=bg)
+        elif kind == "folder":
+            c.create_polygon(cx - s * .42, cy - s * .3, cx - s * .1, cy - s * .3, cx, cy - s * .18,
+                             cx + s * .42, cy - s * .18, cx + s * .42, cy + s * .34, cx - s * .42, cy + s * .34,
+                             **O, joinstyle="round")
+        elif kind == "layers":
+            c.create_polygon(cx, cy - s * .42, cx + s * .44, cy - s * .2, cx, cy + s * .02, cx - s * .44, cy - s * .2,
+                             **O, joinstyle="round")
+            c.create_line(cx - s * .44, cy + s * .02, cx, cy + s * .24, cx + s * .44, cy + s * .02, **L)
+            c.create_line(cx - s * .44, cy + s * .22, cx, cy + s * .44, cx + s * .44, cy + s * .22, **L)
+        elif kind == "send":
+            c.create_polygon(cx - s * .42, cy - s * .06, cx + s * .42, cy - s * .38, cx + s * .1, cy + s * .42,
+                             cx - s * .04, cy + s * .06, **O, joinstyle="round")
+            c.create_line(cx - s * .04, cy + s * .06, cx + s * .42, cy - s * .38, **L)
+        elif kind == "wifi":
+            for i, r in enumerate((s * .46, s * .3)):
+                c.create_arc(cx - r, cy - r + s * .2, cx + r, cy + r + s * .2, start=45, extent=90,
+                             style="arc", outline=col, width=lw)
+            c.create_oval(cx - lw, cy + s * .2 - lw, cx + lw, cy + s * .2 + lw, fill=col, outline=col)
+        elif kind == "help":
+            c.create_oval(cx - h * .9, cy - h * .9, cx + h * .9, cy + h * .9, **O)
+            c.create_text(cx, cy + s * .02, text="?", fill=col, font=F(s * .62 / scale["S"], "bold"))
+        elif kind == "sun":
+            r = s * .2
+            c.create_oval(cx - r, cy - r, cx + r, cy + r, **O)
+            import math
+            for i in range(8):
+                a = i * math.pi / 4
+                c.create_line(cx + math.cos(a) * s * .32, cy + math.sin(a) * s * .32,
+                              cx + math.cos(a) * s * .45, cy + math.sin(a) * s * .45, **L)
+        elif kind == "moon":
+            r = s * .38
+            c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=col, outline=col)
+            c.create_oval(cx - r + s * .24, cy - r - s * .12, cx + r + s * .24, cy + r - s * .12, fill=bg, outline=bg)
+        elif kind == "play":
+            c.create_polygon(cx - s * .28, cy - s * .36, cx + s * .38, cy, cx - s * .28, cy + s * .36,
+                             fill=col, outline=col, joinstyle="round", width=lw)
+        elif kind == "stop":
+            rrect(c, cx - s * .3, cy - s * .3, cx + s * .3, cy + s * .3, s * .08, fill=col, outline=col)
+        elif kind in ("left", "right", "up", "down"):
+            d = {"left": (h * .8, 0, -h * .8, 0), "right": (-h * .8, 0, h * .8, 0),
+                 "up": (0, h * .8, 0, -h * .8), "down": (0, -h * .8, 0, h * .8)}[kind]
+            c.create_line(cx + d[0], cy + d[1], cx + d[2], cy + d[3], arrow="last",
+                          arrowshape=(s * .4, s * .4, s * .22), **L)
+        elif kind in ("chev_right", "chev_down"):
+            if kind == "chev_right":
+                c.create_line(cx - s * .12, cy - s * .26, cx + s * .14, cy, cx - s * .12, cy + s * .26, **L)
+            else:
+                c.create_line(cx - s * .26, cy - s * .12, cx, cy + s * .14, cx + s * .26, cy - s * .12, **L)
 
-    prim_cb = ttk.Checkbutton(frm, text="Primary controller (only this PC controls the other)",
-                              variable=prim_v, command=on_primary)
-    prim_cb.grid(column=0, row=7, columnspan=4, sticky="w", pady=(2, 4))
-    if not CAN_CONTROL:
-        prim_cb.state(["disabled"])
+    class Card(tk.Canvas):
+        """Rounded card; put content in .body."""
+        def __init__(self, parent, P, pad=18, highlight=False):
+            super().__init__(parent, bg=P["bg"], highlightthickness=0, bd=0, height=px(60))
+            self.P, self.pad, self.hl = P, px(pad), highlight
+            self.body = tk.Frame(self, bg=P["card"])
+            self.win = self.create_window(self.pad, self.pad, window=self.body, anchor="nw")
+            self.bind("<Configure>", self._layout)
+            self.body.bind("<Configure>", self._fit)
 
-    # status line with a disclosure arrow that shows/hides the log
-    status_v = tk.StringVar(value="Stopped")
-    srow = ttk.Frame(frm)
-    srow.grid(column=0, row=9, columnspan=4, sticky="w", pady=4)
-    arrow = ttk.Label(srow, text="\u25b8", width=2, cursor="hand2")
-    arrow.pack(side="left")
-    status_lbl = ttk.Label(srow, textvariable=status_v, foreground="#0a5", cursor="hand2")
-    status_lbl.pack(side="left")
+        def _layout(self, e):
+            self.delete("bgr")
+            col = self.P["accent"] if self.hl else self.P["border"]
+            rrect(self, 1, 1, e.width - 2, e.height - 2, px(16), fill=self.P["card"], outline=col,
+                  width=px(2) if self.hl else 1, tags="bgr")
+            self.tag_lower("bgr")
+            self.itemconfigure(self.win, width=max(1, e.width - 2 * self.pad))
 
-    logbox = tk.Text(frm, width=72, height=10, state="disabled", wrap="word", font="TkFixedFont",
-                     borderwidth=0, highlightthickness=0, padx=6, pady=4)  # no scrollbar: wheel scrolls
+        def _fit(self, e):
+            hgt = self.body.winfo_reqheight() + 2 * self.pad
+            if int(self.cget("height")) != hgt:
+                self.configure(height=hgt)
 
-    def toggle_log(_=None):
-        state["log_open"] = not state.get("log_open")
-        if state["log_open"]:
-            logbox.grid(column=0, row=10, columnspan=4, pady=(2, 0))
-            logbox.see("end")
-            arrow.config(text="\u25be")
-        else:
-            logbox.grid_remove()
-            arrow.config(text="\u25b8")
+    class Clickable(tk.Canvas):
+        """A canvas button: draw(c, hover) paints it."""
+        def __init__(self, parent, width, height, draw, command, bg):
+            super().__init__(parent, width=width, height=height, bg=bg, highlightthickness=0, bd=0,
+                             cursor="hand2")
+            self.draw_fn, self.command, self.enabled, self.hover = draw, command, True, False
+            self.bind("<Enter>", lambda e: self._set(True))
+            self.bind("<Leave>", lambda e: self._set(False))
+            self.bind("<ButtonRelease-1>", lambda e: self.enabled and self.command and self.command())
+            self.redraw()
 
-    for w in (arrow, status_lbl):
-        w.bind("<Button-1>", toggle_log)
+        def _set(self, hover):
+            self.hover = hover
+            self.redraw()
 
+        def set_enabled(self, on):
+            self.enabled = on
+            self.configure(cursor="hand2" if on else "arrow")
+            self.redraw()
+
+        def redraw(self):
+            self.delete("all")
+            self.draw_fn(self, self.hover and self.enabled)
+
+    def tile(parent, kind, P, size=44, bg=None):
+        c = tk.Canvas(parent, width=px(size), height=px(size), bg=bg or P["card"], highlightthickness=0, bd=0)
+        rrect(c, 0, 0, px(size), px(size), px(11), fill=P["tile"], outline="")
+        icon(c, kind, px(size) / 2, px(size) / 2, px(size * .48), P["text"], P["tile"])
+        return c
+
+    def icon_button(parent, kind, P, command, size=40, bg=None):
+        def draw(c, hover):
+            fill = P["border"] if hover else P["tile"]
+            rrect(c, 1, 1, px(size) - 1, px(size) - 1, px(10), fill=fill, outline=P["border"])
+            col = P["text"] if c.enabled else P["grey"]
+            icon(c, c.kind, px(size) / 2, px(size) / 2, px(size * .46), col, fill)
+        b = Clickable.__new__(Clickable)
+        b.kind = kind
+        Clickable.__init__(b, parent, px(size), px(size), draw, command, bg or P["card"])
+        return b
+
+    def badge(parent, text, fg, bgc, P, kind=None):
+        f = tkfont.Font(font=F(13, "bold"))
+        iw = px(18) if kind else 0
+        wd, ht = f.measure(text) + px(26) + iw, px(30)
+        c = tk.Canvas(parent, width=wd, height=ht, bg=P["card"], highlightthickness=0, bd=0)
+        rrect(c, 0, 0, wd, ht, ht / 2, fill=bgc, outline="")
+        if kind:
+            icon(c, kind, px(13) + iw / 2 - px(2), ht / 2, px(15), fg, bgc)
+        c.create_text(px(13) + iw, ht / 2, text=text, fill=fg, font=f, anchor="w")
+        return c
+
+    def switch(parent, var, P, command):
+        W_, H_ = px(46), px(26)
+
+        def draw(c, hover):
+            on = var.get()
+            rrect(c, 0, 0, W_, H_, H_ / 2, fill=P["accent"] if on else P["switch_off"], outline="")
+            x = W_ - H_ / 2 if on else H_ / 2
+            r = H_ / 2 - px(3)
+            c.create_oval(x - r, H_ / 2 - r, x + r, H_ / 2 + r, fill=P["knob"], outline="")
+
+        def flip():
+            var.set(not var.get())
+            sw.redraw()
+            command()
+        sw = Clickable(parent, W_, H_, draw, flip, P["card"])
+        return sw
+
+    def label(parent, text, P, size=13, weight="normal", color="text", **kw):
+        return tk.Label(parent, text=text, bg=kw.pop("bg", P["card"]), fg=P[color], font=F(size, weight),
+                        anchor="w", justify="left", **kw)
+
+    def field(parent, var, P, placeholder="", width=20, font=None):
+        """Rounded text field with a placeholder."""
+        hgt = px(42)
+        c = tk.Canvas(parent, height=hgt, bg=P["card"], highlightthickness=0, bd=0)
+        e = tk.Entry(c, textvariable=var, bg=P["field"], fg=P["text"], insertbackground=P["text"],
+                     relief="flat", bd=0, highlightthickness=0, font=font or F(14), width=width,
+                     disabledbackground=P["field"], disabledforeground=P["muted"],
+                     readonlybackground=P["field"])
+        ph = tk.Label(c, text=placeholder, bg=P["field"], fg=P["muted"], font=font or F(14), anchor="w")
+        win = c.create_window(px(14), hgt / 2, window=e, anchor="w")
+        phw = c.create_window(px(16), hgt / 2, window=ph, anchor="w")
+
+        def layout(ev):
+            c.delete("bgr")
+            rrect(c, 1, 1, ev.width - 2, ev.height - 2, px(10), fill=P["field"], outline=P["border"], tags="bgr")
+            c.tag_lower("bgr")
+            c.itemconfigure(win, width=ev.width - px(28))
+
+        def sync(*_):
+            c.itemconfigure(phw, state="hidden" if (var.get() or c.focus_get() is e) else "normal")
+        c.bind("<Configure>", layout)
+        e.bind("<FocusIn>", sync)
+        e.bind("<FocusOut>", sync)
+        ph.bind("<Button-1>", lambda ev: e.focus_set())
+        var.trace_add("write", sync)
+        sync()
+        c.entry = e
+        return c
+
+    # ---------------------------------------------------------------- actions
     def log(s):
-        events.put(("log", time.strftime("%H:%M:%S ") + s))
+        events.put(("log", time.strftime("%H:%M:%S  ") + s))
 
     def status(s):
         events.put(("status", s))
+
+    def bridge_cfg(**kv):  # settings that apply instantly, even while sharing
+        cfg.update(kv)
+        save_config(cfg)
+        if state["bridge"]:
+            state["bridge"].cfg.update(kv)
+
+    def get_code():
+        return "".join(e.get() for e in w.get("code", [])) if w.get("code") else state["code"].replace("-", "")
+
+    def set_code(text):
+        chars = [ch for ch in text.upper() if ch in CODE_ALPHABET][:8]
+        for i, e in enumerate(w["code"]):
+            e.delete(0, "end")
+            if i < len(chars):
+                e.insert(0, chars[i])
+        state["code"] = "".join(chars)
 
     def toggle():
         if state["bridge"]:
             state["bridge"].stop()
             state["bridge"] = None
-            btn.config(text="Start")
-            refresh_tray_menu()
+            refresh_controls()
             return
-        if not pw_v.get().strip():
-            messagebox.showwarning(APP, "Set a pairing code (the same on both PCs).")
+        code = get_code()
+        if len(code) != 8:
+            messagebox.showwarning(APP, "Enter the full 8-character pairing code (the same on both computers).")
             return
-        pw_v.set(normalize_code(pw_v.get().strip()))
         try:
             port = int(port_v.get())
         except ValueError:
             messagebox.showwarning(APP, "Port must be a number.")
             return
-        new = {"peer": peer_v.get().strip(), "port": port, "password": pw_v.get(),
-               "side": side_v.get(), "clipboard": clip_v.get(), "primary": prim_v.get()}
-        cfg.update(new)
+        state["code"] = code[:4] + "-" + code[4:]
+        cfg.update({"peer": peer_v.get().strip(), "port": port, "password": state["code"],
+                    "side": side_v.get(), "clipboard": clip_v.get(), "share_files": files_v.get()})
         save_config(cfg)
         b = Bridge(dict(cfg), log, status)
         b.start()
         state["bridge"] = b
-        btn.config(text="Stop")
-        refresh_tray_menu()
+        refresh_controls()
 
     def refresh_tray_menu():
         if state.get("tray"):
@@ -1521,19 +1868,432 @@ def run_gui():
             except Exception:
                 pass
 
-    btn = ttk.Button(frm, text="Start", command=toggle)
-    btn.grid(column=0, row=8, sticky="w", pady=4)
-
     def send_files_dialog():
         b = state["bridge"]
-        if not b or b.chan is None:
-            messagebox.showinfo(APP, "Connect to the other PC first.")
+        if not files_v.get():
+            messagebox.showinfo(APP, "Turn on “Share files” first.")
             return
-        paths = filedialog.askopenfilenames(parent=root, title=f"Send files to {b.peer_name}")
+        if not b or b.chan is None:
+            messagebox.showinfo(APP, "Connect to the other computer first.")
+            return
+        paths = filedialog.askopenfilenames(parent=root, title=f"Send files to {b.peer_label}")
         if paths:
             b.send_files(paths, "send")
 
-    ttk.Button(frm, text="Send files...", command=send_files_dialog).grid(column=1, row=8, sticky="w", pady=4)
+    def copy_code():
+        code = get_code()
+        root.clipboard_clear()
+        root.clipboard_append(code[:4] + "-" + code[4:] if len(code) == 8 else code)
+        btn = w["copy_btn"]
+        btn.kind = "check"
+        btn.redraw()
+        root.after(1200, lambda: (setattr(btn, "kind", "copy"), btn.redraw()) if btn.winfo_exists() else None)
+
+    def new_code():
+        set_code(new_pairing_code())
+
+    def set_side(side):
+        side_v.set(side)
+        bridge_cfg(side=side)
+        for t in w["dir_tiles"]:
+            t.redraw()
+        w["arrange"].event_generate("<Configure>")
+
+    def switch_theme():
+        state["theme"] = "light" if state["theme"] == "dark" else "dark"
+        cfg["theme"] = state["theme"]
+        save_config(cfg)
+        state["code"] = get_code()
+        build()
+
+    def show_help():
+        messagebox.showinfo(f"{APP} help", (
+            "1. Run Mousync on both computers.\n"
+            "2. Type the same pairing code on both. They find each other on your network.\n"
+            "3. Under Screen Arrangement, pick where the other computer sits.\n"
+            "4. Click Start Sharing on both.\n\n"
+            "Push the cursor off that edge to control the other computer; push it back to return. "
+            "Either computer can control the other.\n\n"
+            "Emergency return: press Esc three times quickly.\n"
+            "Copy text or files on one computer and paste on the other.\n"
+            "Closing the window keeps Mousync running in the "
+            + ("menu bar." if IS_MAC else "system tray.")))
+
+    def toggle_log():
+        state["log_open"] = not state["log_open"]
+        if state["log_open"]:
+            w["log_card"].grid()
+            w["log"].see("end")
+        else:
+            w["log_card"].grid_remove()
+        w["log_btn"].redraw()
+
+    # ---------------------------------------------------------------- layout
+    def build():
+        P = THEMES[state["theme"]]
+        if w.get("main"):
+            w["main"].destroy()
+        w.clear()
+        root.configure(bg=P["bg"])
+        match_title_bar(root, state["theme"])
+        main = tk.Frame(root, bg=P["bg"], padx=px(22), pady=px(16))
+        main.pack(fill="both", expand=True)
+        w["main"] = main
+        gap = px(14)
+        main.grid_columnconfigure(0, minsize=px(500), weight=1)
+        main.grid_columnconfigure(1, minsize=px(430), weight=1)
+
+        # header
+        hdr = tk.Frame(main, bg=P["bg"])
+        hdr.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, px(10)))
+        if app_icon is not None:
+            k = max(1, round(app_icon.width() / px(30)))
+            w["hdr_img"] = app_icon.subsample(k, k)
+            tk.Label(hdr, image=w["hdr_img"], bg=P["bg"]).pack(side="left")
+        tk.Label(hdr, text=APP, bg=P["bg"], fg=P["text"], font=F(20, "bold")).pack(side="left", padx=(px(10), px(6)))
+        tk.Label(hdr, text=VERSION, bg=P["bg"], fg=P["muted"], font=F(17)).pack(side="left", pady=(px(2), 0))
+        icon_button(hdr, "sun" if state["theme"] == "dark" else "moon", P, switch_theme, 38, P["bg"]).pack(
+            side="right")
+        icon_button(hdr, "help", P, show_help, 38, P["bg"]).pack(side="right", padx=(0, px(8)))
+
+        # ---- left column
+        left = tk.Frame(main, bg=P["bg"])
+        left.grid(row=1, column=0, sticky="nsew", padx=(0, gap))
+        tk.Label(left, text="Share your mouse & keyboard", bg=P["bg"], fg=P["text"], font=F(27, "bold"),
+                 anchor="w").pack(fill="x")
+        tk.Label(left, text="Control two computers as one.", bg=P["bg"], fg=P["muted"], font=F(15),
+                 anchor="w").pack(fill="x", pady=(px(2), px(14)))
+
+        # this computer
+        c1 = Card(left, P)
+        c1.pack(fill="x", pady=(0, gap))
+        b = c1.body
+        b.grid_columnconfigure(1, weight=1)
+        tile(b, "laptop" if IS_MAC else "monitor", P, 48).grid(row=0, column=0, rowspan=2, padx=(0, px(14)))
+        label(b, "This Computer", P, 16, "bold").grid(row=0, column=1, sticky="sw")
+        label(b, f"{device_label(OSNAME, socket.gethostname())}   •   {local_ip()}", P, 13,
+              color="muted").grid(row=1, column=1, sticky="nw")
+        badge(b, "This Device", P["green"], P["green_bg"], P).grid(row=0, column=2, rowspan=2, sticky="e")
+
+        # pairing code
+        c2 = Card(left, P, highlight=True)
+        c2.pack(fill="x", pady=(0, gap))
+        b = c2.body
+        b.grid_columnconfigure(1, weight=1)
+        tile(b, "key", P, 48).grid(row=0, column=0, rowspan=2, padx=(0, px(14)), sticky="n")
+        label(b, "Pairing Code", P, 16, "bold").grid(row=0, column=1, sticky="sw")
+        label(b, "Type this same code on the other computer.", P, 13, color="muted").grid(row=1, column=1, sticky="nw")
+        row = tk.Frame(b, bg=P["card"])
+        row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(px(14), 0))
+        boxes = []
+        bw, bh = px(36), px(50)
+        for i in range(8):
+            if i == 4:
+                tk.Label(row, text="–", bg=P["card"], fg=P["muted"], font=F(20, "bold")).pack(side="left", padx=px(3))
+            cv = tk.Canvas(row, width=bw, height=bh, bg=P["card"], highlightthickness=0, bd=0)
+            rrect(cv, 1, 1, bw - 1, bh - 1, px(9), fill=P["tile"], outline=P["border"])
+            e = tk.Entry(cv, width=2, justify="center", bg=P["tile"], fg=P["text"], insertbackground=P["accent"],
+                         relief="flat", bd=0, highlightthickness=0, font=F(22, "bold", mono),
+                         readonlybackground=P["tile"], disabledbackground=P["tile"])
+            cv.create_window(bw / 2, bh / 2, window=e, width=bw - px(8))
+            cv.pack(side="left", padx=(0, px(5)))
+            boxes.append(e)
+        w["code"] = boxes
+
+        def on_key(ev, i):
+            e = boxes[i]
+            if str(e.cget("state")) != "normal":
+                return "break"
+            k = ev.keysym
+            if k in ("Tab", "ISO_Left_Tab"):
+                return None
+            if (ev.state & 0x4 or (IS_MAC and ev.state & 0x8)) and k.lower() == "v":
+                return on_paste(None)
+            if k == "BackSpace":
+                if e.get():
+                    e.delete(0, "end")
+                elif i > 0:
+                    boxes[i - 1].delete(0, "end")
+                    boxes[i - 1].focus_set()
+                return "break"
+            if k == "Left" and i > 0:
+                boxes[i - 1].focus_set()
+            elif k == "Right" and i < 7:
+                boxes[i + 1].focus_set()
+            ch = (ev.char or "").upper()
+            if ch and ch in CODE_ALPHABET:
+                e.delete(0, "end")
+                e.insert(0, ch)
+                if i < 7:
+                    boxes[i + 1].focus_set()
+            return "break"
+
+        def on_paste(_):
+            try:
+                text = root.clipboard_get()
+            except tk.TclError:
+                return "break"
+            if str(boxes[0].cget("state")) == "normal":
+                set_code(text)
+            return "break"
+
+        for i, e in enumerate(boxes):
+            e.bind("<KeyPress>", lambda ev, i=i: on_key(ev, i))
+            e.bind("<<Paste>>", on_paste)
+            e.bind("<FocusIn>", lambda ev: ev.widget.select_range(0, "end"))
+        set_code(state["code"])
+        w["refresh_btn"] = icon_button(row, "refresh", P, new_code)
+        w["refresh_btn"].pack(side="right")
+        w["copy_btn"] = icon_button(row, "copy", P, copy_code)
+        w["copy_btn"].pack(side="right", padx=(px(6), px(8)))
+
+        # other computer
+        c3 = Card(left, P)
+        c3.pack(fill="x")
+        b = c3.body
+        b.grid_columnconfigure(1, weight=1)
+        tile(b, "monitor", P, 48).grid(row=0, column=0, rowspan=2, padx=(0, px(14)), sticky="n")
+        label(b, "Other Computer", P, 16, "bold").grid(row=0, column=1, sticky="sw")
+        w["other_sub"] = label(b, "", P, 13, color="muted")
+        w["other_sub"].grid(row=1, column=1, sticky="nw")
+        w["badge_slot"] = tk.Frame(b, bg=P["card"])
+        w["badge_slot"].grid(row=0, column=2, rowspan=2, sticky="e")
+        frow = tk.Frame(b, bg=P["card"])
+        frow.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(px(14), 0))
+        frow.grid_columnconfigure(0, weight=1)
+        w["ip"] = field(frow, peer_v, P, "Other computer's IP (optional)")
+        w["ip"].grid(row=0, column=0, sticky="ew")
+        label(frow, "Port", P, 14).grid(row=0, column=1, padx=(px(14), px(10)))
+        w["port"] = field(frow, port_v, P, "", 6)
+        w["port"].configure(width=px(96))
+        w["port"].grid(row=0, column=2)
+
+        # ---- right column
+        right = tk.Frame(main, bg=P["bg"])
+        right.grid(row=1, column=1, sticky="nsew")
+        c4 = Card(right, P)
+        c4.pack(fill="x", pady=(0, gap))
+        b = c4.body
+        b.grid_columnconfigure(1, weight=1)
+        hc = tk.Canvas(b, width=px(30), height=px(30), bg=P["card"], highlightthickness=0)
+        icon(hc, "monitor", px(15), px(15), px(24), P["text"], P["card"])
+        hc.grid(row=0, column=0, rowspan=2, sticky="n", padx=(0, px(12)), pady=(px(2), 0))
+        label(b, "Screen Arrangement", P, 16, "bold").grid(row=0, column=1, sticky="w")
+        label(b, "Where is the other computer relative to this one?", P, 13, color="muted").grid(
+            row=1, column=1, sticky="w")
+        arr = tk.Canvas(b, height=px(128), bg=P["card"], highlightthickness=0, bd=0)
+        arr.grid(row=2, column=0, columnspan=2, sticky="ew", pady=px(8))
+        w["arrange"] = arr
+
+        def draw_arrangement(ev=None):
+            arr.delete("all")
+            W_, H_ = arr.winfo_width(), arr.winfo_height()
+            side = side_v.get()
+            vertical = side in ("top", "bottom")
+            bw_, bh_ = (px(92), px(52)) if vertical else (px(104), px(66))
+            gap_ = px(40) if not vertical else px(16)
+            if vertical:
+                tot = 2 * bh_ + gap_
+                me = (W_ / 2 - bw_ / 2, (H_ - tot) / 2 + (bh_ + gap_ if side == "top" else 0))
+                ot = (W_ / 2 - bw_ / 2, (H_ - tot) / 2 + (0 if side == "top" else bh_ + gap_))
+            else:
+                tot = 2 * bw_ + gap_
+                y = (H_ - bh_) / 2 - px(8)
+                me = ((W_ - tot) / 2 + (bw_ + gap_ if side == "left" else 0), y)
+                ot = ((W_ - tot) / 2 + (0 if side == "left" else bw_ + gap_), y)
+            br = state["bridge"]
+            connected = br is not None and br.chan is not None
+            for (x, y), mine in ((me, True), (ot, False)):
+                kind = ("laptop" if IS_MAC else "monitor") if mine else (
+                    "laptop" if connected and br.peer_os == "mac" else "monitor")
+                rrect(arr, x, y, x + bw_, y + bh_, px(12), fill=P["accent_soft"] if mine else P["tile"],
+                      outline=P["accent"] if mine else P["grey"], width=px(3) if mine else px(2))
+                icon(arr, kind, x + bw_ / 2, y + bh_ / 2, px(30), P["text"], P["accent_soft"] if mine else P["tile"])
+                if not vertical:
+                    txt = "This computer" if mine else (br.peer_label if connected else "Other computer")
+                    arr.create_text(x + bw_ / 2, y + bh_ + px(14), text=txt, fill=P["muted"], font=F(11),
+                                    width=bw_ + gap_ - px(4))
+            # dots between
+            if vertical:
+                cx_, cy_ = W_ / 2, min(me[1], ot[1]) + bh_ + gap_ / 2
+                pts = [(cx_, cy_ - px(5)), (cx_, cy_), (cx_, cy_ + px(5))] if False else [(cx_ - px(8), cy_), (cx_, cy_), (cx_ + px(8), cy_)]
+            else:
+                cx_, cy_ = min(me[0], ot[0]) + bw_ + gap_ / 2, me[1] + bh_ / 2
+                pts = [(cx_ - px(8), cy_), (cx_, cy_), (cx_ + px(8), cy_)]
+            for (x, y) in pts:
+                arr.create_oval(x - px(2.5), y - px(2.5), x + px(2.5), y + px(2.5), fill=P["accent"], outline="")
+        arr.bind("<Configure>", draw_arrangement)
+
+        drow = tk.Frame(b, bg=P["card"])
+        drow.grid(row=3, column=0, columnspan=2, sticky="ew")
+        w["dir_tiles"] = []
+        for i, (sd, kind) in enumerate((("left", "left"), ("right", "right"), ("top", "up"), ("bottom", "down"))):
+            drow.grid_columnconfigure(i, weight=1, uniform="d")
+
+            def draw(c, hover, sd=sd, kind=kind):
+                W_, H_ = c.winfo_width(), c.winfo_height()
+                if W_ < 4:
+                    W_ = int(c.cget("width"))
+                sel = side_v.get() == sd
+                fill = P["accent_soft"] if sel else (P["border"] if hover else P["tile"])
+                rrect(c, 1, 1, W_ - 2, H_ - 2, px(11), fill=fill, outline=P["accent"] if sel else P["border"],
+                      width=px(2) if sel else 1)
+                icon(c, kind, W_ / 2, H_ * .36, px(18), P["text"], fill)
+                c.create_text(W_ / 2, H_ * .72, text=sd.capitalize(), fill=P["text"], font=F(13))
+            t = Clickable(drow, px(90), px(58), draw, lambda sd=sd: set_side(sd), P["card"])
+            t.bind("<Configure>", lambda e, t=t: t.redraw(), add="+")
+            t.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else px(4), 0 if i == 3 else px(4)))
+            w["dir_tiles"].append(t)
+
+        # sharing
+        c5 = Card(right, P)
+        c5.pack(fill="x")
+        b = c5.body
+        b.grid_columnconfigure(1, weight=1)
+        hc = tk.Canvas(b, width=px(30), height=px(30), bg=P["card"], highlightthickness=0)
+        icon(hc, "layers", px(15), px(15), px(24), P["text"], P["card"])
+        hc.grid(row=0, column=0, padx=(0, px(12)), sticky="w")
+        label(b, "Sharing", P, 16, "bold").grid(row=0, column=1, sticky="w")
+
+        def share_row(r, kind, title, sub, right_widget_fn, command=None):
+            fr = tk.Frame(b, bg=P["card"])
+            fr.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(px(10), 0))
+            fr.grid_columnconfigure(1, weight=1)
+            tile(fr, kind, P, 44).grid(row=0, column=0, rowspan=2, padx=(0, px(12)))
+            t1 = label(fr, title, P, 14, "bold")
+            t1.grid(row=0, column=1, sticky="sw")
+            t2 = label(fr, sub, P, 12, color="muted")
+            t2.grid(row=1, column=1, sticky="nw")
+            right_widget_fn(fr).grid(row=0, column=2, rowspan=2, sticky="e")
+            if command:
+                for wd in (fr, t1, t2):
+                    wd.configure(cursor="hand2")
+                    wd.bind("<ButtonRelease-1>", lambda e: command())
+            return fr
+
+        def sep(r):
+            tk.Frame(b, bg=P["border"], height=1).grid(row=r, column=0, columnspan=2, sticky="ew", pady=(px(10), 0))
+
+        share_row(1, "clipboard", "Share clipboard (text)", "Copy text on one computer, paste on the other",
+                  lambda fr: switch(fr, clip_v, P, lambda: bridge_cfg(clipboard=clip_v.get())))
+        sep(2)
+        share_row(3, "folder", "Share files", "Copy files on one computer, paste on the other",
+                  lambda fr: switch(fr, files_v, P, lambda: bridge_cfg(share_files=files_v.get())))
+        sep(4)
+
+        def chevron(fr):
+            c = tk.Canvas(fr, width=px(26), height=px(26), bg=P["card"], highlightthickness=0, cursor="hand2")
+            icon(c, "chev_right", px(13), px(13), px(18), P["muted"], P["card"])
+            c.bind("<ButtonRelease-1>", lambda e: send_files_dialog())
+            return c
+        share_row(5, "send", "Send files…", "Into Downloads/Mousync on the other computer", chevron,
+                  send_files_dialog)
+
+        # ---- bottom bar
+        bar = Card(main, P, pad=14)
+        bar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(gap, 0))
+        b = bar.body
+        b.grid_columnconfigure(3, weight=1)
+
+        def draw_start(c, hover):
+            W_, H_ = c.winfo_width(), c.winfo_height()
+            if W_ < 4:
+                W_ = int(c.cget("width"))
+            on = state["bridge"] is not None
+            fill = P["accent_hover"] if hover else P["accent"]
+            rrect(c, 0, 0, W_, H_, px(12), fill=fill, outline="")
+            txt = "Stop Sharing" if on else "Start Sharing"
+            f = tkfont.Font(font=F(17, "bold"))
+            tw = f.measure(txt) + px(30)
+            x0 = (W_ - tw) / 2
+            icon(c, "stop" if on else "play", x0 + px(9), H_ / 2, px(20), P["on_accent"], fill)
+            c.create_text(x0 + px(30), H_ / 2, text=txt, fill=P["on_accent"], font=f, anchor="w")
+        start = Clickable(b, px(430), px(54), draw_start, toggle, P["card"])
+        start.bind("<Configure>", lambda e: start.redraw(), add="+")
+        start.grid(row=0, column=0, sticky="w")
+        w["start"] = start
+        tk.Frame(b, bg=P["border"], width=1, height=px(40)).grid(row=0, column=1, padx=px(18))
+        dot = tk.Canvas(b, width=px(14), height=px(14), bg=P["card"], highlightthickness=0)
+        dot.grid(row=0, column=2, padx=(0, px(10)))
+        w["dot"] = dot
+        st = tk.Frame(b, bg=P["card"])
+        st.grid(row=0, column=3, sticky="w")
+        w["st_title"] = label(st, "", P, 15, "bold")
+        w["st_title"].pack(anchor="w")
+        w["st_sub"] = label(st, "", P, 12, color="muted")
+        w["st_sub"].pack(anchor="w")
+
+        def draw_log_btn(c, hover):
+            col = P["text"] if hover else P["muted"]
+            c.create_text(px(4), px(17), text="Activity", fill=col, font=F(13), anchor="w")
+            icon(c, "chev_down" if state["log_open"] else "chev_right", px(84), px(17), px(16), col, P["card"])
+        w["log_btn"] = Clickable(b, px(96), px(34), draw_log_btn, toggle_log, P["card"])
+        w["log_btn"].grid(row=0, column=4, sticky="e")
+
+        # activity log (hidden until opened)
+        lc = Card(main, P, pad=12)
+        lc.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(gap, 0))
+        txt = tk.Text(lc.body, height=9, wrap="word", bg=P["card"], fg=P["muted"], font=F(12, fam=mono),
+                      relief="flat", bd=0, highlightthickness=0, padx=px(4), pady=px(2),
+                      insertbackground=P["text"])  # no scrollbar: the mouse wheel scrolls
+        txt.pack(fill="both", expand=True)
+        txt.insert("end", "\n".join(state["log_lines"]) + ("\n" if state["log_lines"] else ""))
+        txt.configure(state="disabled")
+        txt.see("end")
+        w["log"], w["log_card"] = txt, lc
+        if not state["log_open"]:
+            lc.grid_remove()
+
+        refresh_controls()
+        show_status(state["status"])
+
+    def refresh_controls():
+        """Reflect running / stopped: lock fields that need a restart, update the button."""
+        if not w:
+            return
+        running = state["bridge"] is not None
+        for e in w["code"]:
+            e.configure(state="readonly" if running else "normal")
+        for f_ in (w["ip"], w["port"]):
+            f_.entry.configure(state="readonly" if running else "normal")
+        w["refresh_btn"].set_enabled(not running)
+        w["start"].redraw()
+        refresh_other()
+        refresh_tray_menu()
+
+    def refresh_other():
+        P = THEMES[state["theme"]]
+        br = state["bridge"]
+        connected = br is not None and br.chan is not None
+        manual = bool(peer_v.get().strip())
+        if connected:
+            w["other_sub"].configure(text=f"Connected:  {br.peer_label}")
+        elif manual:
+            w["other_sub"].configure(text="Connects straight to this IP.")
+        else:
+            w["other_sub"].configure(text="Found automatically on your network.")
+        for ch in w["badge_slot"].winfo_children():
+            ch.destroy()
+        if manual:
+            badge(w["badge_slot"], "Manual IP", P["blue"], P["blue_bg"], P).pack()
+        else:
+            badge(w["badge_slot"], "Auto Discovery", P["green"], P["green_bg"], P, "wifi").pack()
+        w["arrange"].event_generate("<Configure>")
+
+    def show_status(s):
+        state["status"] = s
+        if not w:
+            return
+        P = THEMES[state["theme"]]
+        colour, title, sub = status_view(s)
+        dot = w["dot"]
+        dot.delete("all")
+        dot.create_oval(px(1), px(1), px(13), px(13), fill=P[colour], outline="")
+        w["st_title"].configure(text=title)
+        w["st_sub"].configure(text=sub)
+        refresh_other()
+
+    peer_v.trace_add("write", lambda *_: w and refresh_other())
 
     def pump():
         while True:
@@ -1544,14 +2304,17 @@ def run_gui():
             if kind == "call":
                 s()
             elif kind == "status":
-                status_v.set(s)
+                show_status(s)
                 if state.get("tray"):
                     state["tray"].title = f"{APP}: {s}"[:127]
             else:
-                logbox.config(state="normal")
-                logbox.insert("end", s + "\n")
-                logbox.see("end")
-                logbox.config(state="disabled")
+                state["log_lines"] = (state["log_lines"] + [s])[-500:]
+                if w.get("log"):
+                    t = w["log"]
+                    t.configure(state="normal")
+                    t.insert("end", s + "\n")
+                    t.see("end")
+                    t.configure(state="disabled")
         root.after(100, pump)
 
     # ---- background mode: closing the window hides it; the tray icon keeps the app alive
@@ -1567,7 +2330,7 @@ def run_gui():
         root.withdraw()
         if not state.get("hinted"):
             state["hinted"] = True
-            where = "menu bar" if sys.platform == "darwin" else "system tray"
+            where = "menu bar" if IS_MAC else "system tray"
             log(f"Still running in the background. Use the {where} icon to show or quit {APP}.")
 
     def quit_app():
@@ -1581,6 +2344,12 @@ def run_gui():
                 pass
         root.destroy()
 
+    build()
+    root.update_idletasks()
+    room = root.winfo_screenheight() - px(90)          # leave space for taskbar / menu bar + title bar
+    if root.winfo_reqheight() > room:
+        scale["S"] = max(0.7, scale["S"] * room / root.winfo_reqheight())
+        build()
     try:
         import pystray
         state["tray"] = make_tray([
@@ -1595,11 +2364,11 @@ def run_gui():
         log(f"No tray icon ({e}); closing the window will quit.")
 
     root.protocol("WM_DELETE_WINDOW", hide_window if state["tray"] else quit_app)
-    if sys.platform == "darwin":
+    if IS_MAC:
         root.createcommand("tk::mac::ReopenApplication", show_window)  # click on the Dock icon
         root.createcommand("tk::mac::Quit", quit_app)                  # Cmd+Q / Dock > Quit
     pump()
-    if cfg["password"] and "--autostart" in sys.argv:
+    if cfg.get("password") and "--autostart" in sys.argv:
         toggle()
         if state["tray"]:
             root.withdraw()  # started with the computer: go straight to the tray
@@ -1615,8 +2384,6 @@ def run_cli(args):
             cfg[k] = v
     if args.no_clipboard:
         cfg["clipboard"] = False
-    if args.primary:
-        cfg["primary"] = True
     if args.code:
         cfg["password"] = args.code
     if not cfg["password"]:
@@ -1651,7 +2418,6 @@ def main():
     p.add_argument("--password", help=argparse.SUPPRESS)  # 1.0 name for --code
     p.add_argument("--side", choices=["left", "right", "top", "bottom"], help="where the other PC sits")
     p.add_argument("--no-clipboard", action="store_true")
-    p.add_argument("--primary", action="store_true", help="only this PC may control the other")
     args = p.parse_args()
     if args.nogui:
         run_cli(args)

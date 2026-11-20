@@ -8,13 +8,14 @@ A small ShareMouse-style app for your local network.
 - **Shared clipboard, both ways**: copy text on either PC and paste it on the other, straight away.
 - **File sharing**: copy files or folders in Explorer/Finder on one PC, then paste them in a folder on the other (Ctrl+V / Cmd+V). Or click **Send files...** (also in the tray menu) to drop files into `Downloads/Mousync` on the other PC.
 - Mouse buttons (left, right, middle, back and forward), scroll wheel, and the full keyboard, including shortcuts like Ctrl+C or Alt+Tab.
-- **Both directions**: Windows and Mac PCs can each control the other. Tick **Primary controller** on one PC to make it the only one that controls; leave it unticked on both and either PC can take over. The setting applies immediately, even while connected.
+- **Both directions**: Windows and Mac PCs can each control the other. Push off the edge on whichever PC you're using and you're on the other one. No setup needed.
 - **Finds the other PC automatically**: type the same pairing code on both PCs and they connect. No IP address needed.
 - AES-256-GCM encryption keyed from the pairing code. A PC with a different code is ignored.
 - Reconnects automatically, and sends a heartbeat every 2 s. If the link drops, control returns to your PC.
 - **Runs in the background**: closing the window hides it to the system tray (Windows) or the menu bar (Mac). Use the tray icon to show the window, start or stop sharing, or quit. When started with Windows, it goes straight to the tray.
 - **Emergency return**: press **Esc three times** quickly (or Scroll Lock on Windows) and control comes straight back to your PC.
-- The log is tucked away: click the little arrow next to the status line to show or hide it.
+- **Same look on Windows and Mac**, with a **dark/light switch** (sun/moon button, top right). The other computer is shown as `OS (name)`, for example `macOS (XD.local)`.
+- The activity log is tucked away: click **Activity** next to the status to show or hide it.
 - Multi-monitor support (it uses the edge of the whole desktop) and correct handling of DPI scaling.
 
 ## Setup (2 minutes)
@@ -26,9 +27,9 @@ A small ShareMouse-style app for your local network.
 
 **If they don't find each other** (some routers block broadcast between Wi-Fi and wired, or "client isolation" is on), type the other PC's IP into *Other PC's IP* on one PC. That PC then connects directly. Also check that Windows lists the network as **Private**, not Public.
 
-Want a single `.exe` with no Python? Run `build_exe.bat` once, then copy `dist\Mousync.exe` to both PCs.
+Want a single `.exe` with no Python? Run `build_exe.bat` once, then copy `dist\Mousync.exe` to both PCs. Or download **Mousync-Windows-Portable** from any GitHub Actions run (every push to `main` builds one): it's a single `Mousync-Portable.exe` you just double-click, no install.
 
-Terminal mode: `python mousync.py --nogui --code K7MQ-2PXH --side right [--peer 192.168.1.20] [--primary]` (omit `--code` to have one generated)
+Terminal mode: `python mousync.py --nogui --code K7MQ-2PXH --side right [--peer 192.168.1.20]` (omit `--code` to have one generated)
 
 ## Notes
 - **How auto-connect works:** each PC broadcasts a small beacon on UDP 24851 every second. The beacon has an HMAC proof made from the pairing code, never the code itself. A PC that sees a beacon with a matching proof connects to it.
@@ -37,7 +38,7 @@ Terminal mode: `python mousync.py --nogui --code K7MQ-2PXH --side right [--peer 
 - **macOS:** allow Mousync under System Settings → Privacy & Security → **Accessibility** and **Input Monitoring**, then restart it. Without these it can't control or be controlled.
 - **Linux:** can be controlled, but can't control the other PC.
 - **Mac ↔ Windows keys:** Cmd and Ctrl swap places, so the usual shortcuts just work. Cmd+C on a Mac keyboard is Ctrl+C on Windows, and Ctrl+C on a Windows keyboard is Cmd+C on a Mac. Option = Alt.
-- **While controlling:** the local cursor stays parked in the middle of your screen.
+- **While controlling:** on a Mac, the local cursor stays frozen at the edge where it crossed; on Windows it's parked in the middle of the screen.
 - **Clipboard:** text and files. Images copied from apps (screenshots, "Copy image") are not shared yet.
 - **How file sharing works, and its limits:**
   - Copied files are sent **as soon as you copy**, before you paste, so they're ready when you do. That uses network bandwidth even if you never paste. Copies over **2 GB** are not sent automatically (set `"file_limit_mb"` in `~/.mousync.json` to change this); use **Send files...** for those.

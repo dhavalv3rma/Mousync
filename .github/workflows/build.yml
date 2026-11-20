@@ -2,7 +2,8 @@ name: Build installers
 
 on:
   push:
-    tags: ["v*"]        # push a tag like v1.0 to build + publish a release
+    branches: [main]    # every push to main: test builds under the run's Artifacts
+    tags: ["v*"]        # push a tag like v1.0 to also publish a release
   workflow_dispatch:     # or run it by hand from the Actions tab
 
 permissions:
@@ -20,6 +21,12 @@ jobs:
         run: pip install -r requirements.txt pyinstaller
       - name: Build Mousync.exe
         run: pyinstaller --noconfirm --onefile --windowed --name Mousync --icon assets/icon.ico --add-data "assets;assets" --hidden-import pystray._win32 mousync.py
+      - name: Portable exe (no install needed, just double-click)
+        run: Copy-Item dist\Mousync.exe Mousync-Portable.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Mousync-Windows-Portable
+          path: Mousync-Portable.exe
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
       - name: Build installer
@@ -70,4 +77,5 @@ jobs:
         with:
           files: |
             out/Mousync-Windows/Mousync-Setup.exe
+            out/Mousync-Windows-Portable/Mousync-Portable.exe
             out/Mousync-macOS/Mousync.dmg
