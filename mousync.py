@@ -8,14 +8,15 @@ How it works
     local network automatically (UDP broadcast); no IP address needed.
   * Push the cursor off the screen edge that faces the other PC. Your mouse and keyboard
     now control that PC. Push it back off the opposite edge to return.
-  * The clipboard (text) follows the cursor between the two PCs.
+  * The text clipboard is synced both ways: copy on one PC, paste on the other.
   * All traffic is encrypted with AES-256-GCM, using a key derived from the pairing code.
     Discovery beacons carry only an HMAC proof of the code, never the code itself.
-  * Emergency key: Scroll Lock brings control back to this PC at once.
+  * Emergency return: press Esc three times quickly (or Scroll Lock on Windows).
 
 Platform support
-  * Windows  : can control the other PC AND be controlled by it.
-  * macOS/Linux : can be controlled. Controlling from them is not built yet.
+  * Windows and macOS : can control the other PC AND be controlled by it.
+  * Linux             : can be controlled.
+  * Tick "Primary controller" on one PC to make it the only one that can control.
 """
 import argparse
 import ctypes
@@ -32,6 +33,7 @@ import threading
 import time
 
 IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
 if IS_WIN:  # use physical pixels on scaled (125%/150%) displays
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -52,6 +54,18 @@ try:
 except ImportError:  # clipboard sync is optional
     pyperclip = None
 
+Quartz = AppKit = None
+if IS_MAC:  # pyobjc ships with pynput / pystray on macOS
+    try:
+        import Quartz
+    except ImportError:
+        pass
+    try:
+        import AppKit
+    except ImportError:
+        pass
+CAN_CONTROL = IS_WIN or (IS_MAC and Quartz is not None)  # can capture this PC's mouse/keyboard
+
 APP = "Mousync"
 VERSION = "1.1"
 DEFAULT_PORT = 24850
@@ -60,7 +74,7 @@ CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I/L
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".mousync.json")
 OLD_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".mousebridge.json")  # pre-rename settings
 ASSET_DIR = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "assets")
-OSNAME = "win" if IS_WIN else ("mac" if sys.platform == "darwin" else "linux")
+OSNAME = "win" if IS_WIN else ("mac" if IS_MAC else "linux")
 
 LOCAL, REMOTE, CONTROLLED = "local", "remote", "controlled"
 OPP = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
@@ -76,7 +90,30 @@ def screen_bounds():
         x, y = u.GetSystemMetrics(76), u.GetSystemMetrics(77)
         w, h = u.GetSystemMetrics(78), u.GetSystemMetrics(79)
         return x, y, x + w - 1, y + h - 1
+    if IS_MAC and Quartz is not None:
+        try:
+            _, ids, n = Quartz.CGGetActiveDisplayList(16, None, None)
+            rs = [Quartz.CGDisplayBounds(d) for d in ids[:n]]
+            if rs:
+                return (int(min(r.origin.x for r in rs)), int(min(r.origin.y for r in rs)),
+                        int(max(r.origin.x + r.size.width for r in rs)) - 1,
+                        int(max(r.origin.y + r.size.height for r in rs)) - 1)
+        except Exception:
+            pass
     return tuple(_FALLBACK_BOUNDS)
+
+
+def warp_cursor(x, y):
+    if IS_WIN:
+        ctypes.windll.user32.SetCursorPos(int(x), int(y))
+    elif IS_MAC and Quartz is not None:
+        Quartz.CGWarpMouseCursorPosition((float(x), float(y)))
+
+
+def mac_lock_cursor(locked):
+    """While controlling the other PC, freeze the Mac cursor but keep receiving mouse deltas."""
+    if IS_MAC and Quartz is not None:
+        Quartz.CGAssociateMouseAndMouseCursorPosition(not locked)
 
 
 def set_fallback_bounds(width, height):
@@ -123,6 +160,18 @@ def clip_get():
         return None
 
 
+def clip_seq():
+    """Cheap 'has the clipboard changed?' counter, or None to always re-read."""
+    try:
+        if IS_WIN:
+            return ctypes.windll.user32.GetClipboardSequenceNumber()
+        if IS_MAC and AppKit is not None:
+            return AppKit.NSPasteboard.generalPasteboard().changeCount()
+    except Exception:
+        pass
+    return None
+
+
 def clip_set(s):
     if pyperclip and isinstance(s, str):
         try:
@@ -166,13 +215,35 @@ def broadcast_addrs():
 OEM_CHARS = {0xBA: ";", 0xBB: "=", 0xBC: ",", 0xBD: "-", 0xBE: ".", 0xBF: "/",
              0xC0: "`", 0xDB: "[", 0xDC: "\\", 0xDD: "]", 0xDE: "'"}
 VK_TO_NAME = {}
-if IS_WIN:
+if IS_WIN or IS_MAC:
     for _k in Key:
+        if _k.name.startswith("media_"):  # on macOS these reuse normal key codes (0x10 = Y!)
+            continue
         try:
             if _k.value.vk is not None:
                 VK_TO_NAME.setdefault(_k.value.vk, _k.name)
         except Exception:
             pass
+
+# macOS virtual key code -> unshifted character (ANSI layout), so Windows gets 'c', not a Mac-only code
+MAC_CHARS = {
+    0x00: "a", 0x01: "s", 0x02: "d", 0x03: "f", 0x04: "h", 0x05: "g", 0x06: "z", 0x07: "x",
+    0x08: "c", 0x09: "v", 0x0B: "b", 0x0C: "q", 0x0D: "w", 0x0E: "e", 0x0F: "r", 0x10: "y",
+    0x11: "t", 0x12: "1", 0x13: "2", 0x14: "3", 0x15: "4", 0x16: "6", 0x17: "5", 0x18: "=",
+    0x19: "9", 0x1A: "7", 0x1B: "-", 0x1C: "8", 0x1D: "0", 0x1E: "]", 0x1F: "o", 0x20: "u",
+    0x21: "[", 0x22: "i", 0x23: "p", 0x25: "l", 0x26: "j", 0x27: "'", 0x28: "k", 0x29: ";",
+    0x2A: "\\", 0x2B: ",", 0x2C: "/", 0x2D: "n", 0x2E: "m", 0x2F: ".", 0x32: "`",
+    0x41: ".", 0x43: "*", 0x45: "+", 0x4B: "/", 0x4E: "-", 0x52: "0", 0x53: "1", 0x54: "2",
+    0x55: "3", 0x56: "4", 0x57: "5", 0x58: "6", 0x59: "7", 0x5B: "8", 0x5C: "9",
+}
+# modifier key code -> device-dependent flag bit (tells left/right press vs release apart)
+MAC_MOD_BITS = {0x3B: 0x01, 0x38: 0x02, 0x3C: 0x04, 0x37: 0x08, 0x36: 0x10,
+                0x3A: 0x20, 0x3D: 0x40, 0x3E: 0x2000}
+MAC_CAPS = 0x39
+MAC_ESC, VK_ESCAPE = 0x35, 0x1B
+# Between a Mac and a PC, Cmd and Ctrl trade places so Cmd+C on a Mac keyboard is Ctrl+C on Windows.
+CMD_CTRL_SWAP = {"cmd": "ctrl", "cmd_l": "ctrl_l", "cmd_r": "ctrl_r",
+                 "ctrl": "cmd", "ctrl_l": "cmd_l", "ctrl_r": "cmd_r"}
 
 
 def vk_char(vk):
@@ -184,10 +255,12 @@ def vk_char(vk):
 
 
 def portable_to_key(m, peer_os):
-    if IS_WIN and peer_os == "win" and m.get("vk") is not None:
-        return KeyCode.from_vk(m["vk"])
+    if peer_os == OSNAME and OSNAME in ("win", "mac") and m.get("vk") is not None:
+        return KeyCode.from_vk(m["vk"])  # same OS: replay the exact key
     name = m.get("name")
     if name:
+        if (OSNAME == "mac") != (peer_os == "mac"):
+            name = CMD_CTRL_SWAP.get(name, name)
         try:
             return Key[name]
         except KeyError:
@@ -274,6 +347,10 @@ class Bridge:
         self.ctrl_from = "left"
         self.peer_os = None
         self.peer_name = None
+        self.peer_primary = False
+        self.last_clip = None    # last clipboard text sent or received (prevents echo loops)
+        self.clip_mark = None
+        self.esc_times = []
         self.held = set()        # keys we are holding down while being controlled
         self.held_btn = set()
         self.scroll_acc = [0.0, 0.0]
@@ -294,22 +371,32 @@ class Bridge:
         threading.Thread(target=self._send_loop, daemon=True).start()
         if self.auto:
             threading.Thread(target=self._disc_loop, daemon=True).start()
+        threading.Thread(target=self._clip_loop, daemon=True).start()
         if IS_WIN:
             self.ml = mouse.Listener(win32_event_filter=self._mfilter)
             self.kl = keyboard.Listener(win32_event_filter=self._kfilter)
+        elif CAN_CONTROL:  # macOS
+            self.ml = mouse.Listener(darwin_intercept=self._mac_mouse)
+            self.kl = keyboard.Listener(darwin_intercept=self._mac_key)
+        if self.ml:
             self.ml.start()
             self.kl.start()
+            if IS_MAC and not getattr(self.ml, "IS_TRUSTED", True):
+                self.log("macOS has not allowed Mousync to use the mouse and keyboard yet. Allow it under "
+                         "System Settings > Privacy & Security > Accessibility and Input Monitoring, then restart it.")
+            esc = "Esc x3 or Scroll Lock" if IS_WIN else "Esc x3"
             self.log(f"Move the cursor off the {self.cfg['side'].upper()} edge to control the other PC. "
-                     "Scroll Lock = emergency return.")
+                     f"Emergency return: {esc}.")
         else:
-            self.log("This PC can be controlled by a Windows PC running Mousync. "
-                     "(Controlling others from macOS/Linux is not supported yet.)")
+            self.log("This PC can be controlled by the other PC (controlling from Linux is not supported).")
 
     def stop(self):
         self.running = False
         with self.lock:
             if self.state == CONTROLLED:
                 self._release_playback()
+            elif self.state == REMOTE:
+                self._go_local(0.5)      # also gives the Mac its cursor back
             self.state = LOCAL
         for l in (self.ml, self.kl):
             if l:
@@ -378,16 +465,19 @@ class Bridge:
                 if sock is None:
                     continue
                 chan = Channel(sock, self.key)
-                chan.send({"t": "hello", "name": socket.gethostname(), "os": OSNAME, "v": VERSION})
+                chan.send({"t": "hello", "name": socket.gethostname(), "os": OSNAME, "v": VERSION,
+                           "primary": bool(self.cfg.get("primary")), "can_control": CAN_CONTROL})
                 hello = chan.recv()
                 if hello.get("t") != "hello":
                     raise ConnectionError("bad handshake")
                 self.peer_os, self.peer_name = hello.get("os"), hello.get("name", "?")
+                self.peer_primary = bool(hello.get("primary"))
+                self.last_clip, self.clip_mark = clip_get(), clip_seq()  # sync new copies, not old ones
                 with self.out.mutex:
                     self.out.queue.clear()
                 self.chan = chan
                 self.status(f"Connected to {self.peer_name} ({self.peer_os})")
-                self.log(f"Connected to {self.peer_name}")
+                self.log(f"Connected to {self.peer_name}. {self.role_text()}")
                 while self.running:
                     self._handle(chan.recv())
             except InvalidTag:
@@ -464,6 +554,48 @@ class Bridge:
                 self.mismatch.add(pid)
                 self.log(f"Saw Mousync on {name} ({addr[0]}), but it uses a different pairing code")
 
+    # ---- who may control whom
+    def can_control(self):
+        return CAN_CONTROL and (bool(self.cfg.get("primary")) or not self.peer_primary)
+
+    def role_text(self):
+        me, peer, name = bool(self.cfg.get("primary")), self.peer_primary, self.peer_name or "the other PC"
+        if me and peer:
+            return "Both PCs are ticked as primary, so either can control the other."
+        if me:
+            return f"This PC is the primary controller: {name} can't control it."
+        if peer:
+            return f"{name} is the primary controller: this PC can't control it."
+        return "Either PC can control the other."
+
+    def set_primary(self, primary):
+        self.cfg["primary"] = bool(primary)
+        self.send({"t": "role", "primary": bool(primary)})
+        self._apply_role()
+
+    def _apply_role(self):
+        if self.chan is not None:
+            self.log(self.role_text())
+        with self.lock:
+            if self.state == REMOTE and not self.can_control():
+                self._go_local(0.5, notify=True)
+
+    # ---- clipboard: sync every new copy, both ways
+    def _clip_loop(self):
+        while self.running:
+            time.sleep(0.4)
+            if self.chan is None or not self.cfg.get("clipboard", True):
+                continue
+            mark = clip_seq()
+            if mark is not None and mark == self.clip_mark:
+                continue          # unchanged: skip reading it
+            self.clip_mark = mark
+            text = clip_get()
+            if not text or text == self.last_clip:
+                continue
+            self.last_clip = text
+            self.send({"t": "clip", "text": text})
+
     def _send_loop(self):
         while self.running:
             try:
@@ -486,14 +618,28 @@ class Bridge:
         t = m.get("t")
         if t == "ping":
             return
+        if t == "clip":
+            text = m.get("text")
+            if isinstance(text, str) and self.cfg.get("clipboard", True):
+                self.last_clip = text
+                clip_set(text)
+                self.clip_mark = clip_seq()
+            return
+        if t == "role":
+            self.peer_primary = bool(m.get("primary"))
+            self._apply_role()
+            return
         if t == "enter":
+            if self.cfg.get("primary") and not self.peer_primary:   # we are the only controller
+                self.send({"t": "leave", "ratio": m.get("ratio", 0.5)})
+                return
             with self.lock:
                 if self.state == REMOTE:          # both crossed at once: yield
                     self._go_local(0.5)
                 self.state = CONTROLLED
                 self.ctrl_from = m.get("from", "left")
                 self.scroll_acc = [0.0, 0.0]
-            if m.get("clip") is not None and self.cfg.get("clipboard", True):
+            if m.get("clip") is not None and self.cfg.get("clipboard", True):  # from 1.0 peers
                 clip_set(m["clip"])
             self.mctl.position = edge_point(self.ctrl_from, m.get("ratio", 0.5), 2)
             self.status(f"Controlled by {self.peer_name}")
@@ -560,8 +706,7 @@ class Bridge:
             with self.lock:
                 self._release_playback()
                 self.state = LOCAL
-            use_clip = self.cfg.get("clipboard", True)
-            self.send(lambda: {"t": "leave", "ratio": ratio, "clip": clip_get() if use_clip else None})
+            self.send({"t": "leave", "ratio": ratio})
             self.status(f"Connected to {self.peer_name}")
 
     def _release_playback(self):
@@ -581,27 +726,27 @@ class Bridge:
     # ---- controlling the peer (Windows low-level hooks)
     def _enter_remote(self, x, y):
         with self.lock:
-            if self.state != LOCAL or self.chan is None or time.time() < self.cooldown:
+            if (self.state != LOCAL or self.chan is None or time.time() < self.cooldown
+                    or not self.can_control()):
                 return False
             side = self.cfg["side"]
             ratio = edge_ratio(side, x, y)
             l, t, r, b = screen_bounds()
             self.park = ((l + r) // 2, (t + b) // 2)
-            ctypes.windll.user32.SetCursorPos(*self.park)
+            warp_cursor(*self.park)
+            mac_lock_cursor(True)
+            self.esc_times = []
             self.state = REMOTE
-        use_clip = self.cfg.get("clipboard", True)
-        self.send(lambda: {"t": "enter", "from": OPP[side], "ratio": ratio,
-                           "clip": clip_get() if use_clip else None})
-        self.status(f"Controlling {self.peer_name}  (Scroll Lock = come back)")
+        self.send({"t": "enter", "from": OPP[side], "ratio": ratio})
+        self.status(f"Controlling {self.peer_name}  (Esc x3 = come back)")
         return True
 
     def _go_local(self, ratio, notify=False):
         """Call with self.lock held."""
         self.state = LOCAL
         self.cooldown = time.time() + 0.4
-        x, y = edge_point(self.cfg["side"], ratio, 6)
-        if IS_WIN:
-            ctypes.windll.user32.SetCursorPos(x, y)
+        mac_lock_cursor(False)
+        warp_cursor(*edge_point(self.cfg["side"], ratio, 6))
         if notify:
             self.send({"t": "release"})
         self.status(f"Connected to {self.peer_name}" if self.chan else "Not connected")
@@ -609,8 +754,20 @@ class Bridge:
     def _hit_edge(self, x, y):
         l, t, r, b = screen_bounds()
         side = self.cfg["side"]
-        return ((side == "right" and x >= r) or (side == "left" and x <= l) or
-                (side == "top" and y <= t) or (side == "bottom" and y >= b))
+        return ((side == "right" and x >= r - 0.5) or (side == "left" and x <= l + 0.5) or
+                (side == "top" and y <= t + 0.5) or (side == "bottom" and y >= b - 0.5))
+
+    def _esc_pressed(self):
+        """Three Esc presses within a second while controlling = come back. True if it fired."""
+        now = time.time()
+        self.esc_times = [t for t in self.esc_times if now - t < 1.0] + [now]
+        if len(self.esc_times) < 3:
+            return False
+        self.esc_times = []
+        with self.lock:
+            if self.state == REMOTE:
+                self._go_local(0.5, notify=True)
+        return True
 
     def _mfilter(self, msg, data):
         if data.flags & LLMHF_INJECTED:
@@ -618,7 +775,7 @@ class Bridge:
         if self.state == REMOTE:
             self._forward_mouse(msg, data)
             self.ml.suppress_event()
-        elif self.state == LOCAL and msg == WM_MOUSEMOVE and self.chan is not None:
+        elif self.state == LOCAL and msg == WM_MOUSEMOVE and self.chan is not None and self.can_control():
             if self._hit_edge(data.pt.x, data.pt.y) and self._enter_remote(data.pt.x, data.pt.y):
                 self.ml.suppress_event()
         return False
@@ -652,6 +809,8 @@ class Bridge:
                     with self.lock:
                         if self.state == REMOTE:
                             self._go_local(0.5, notify=True)
+            elif down and vk == VK_ESCAPE and self._esc_pressed():
+                pass
             else:
                 self.send({"t": "key", "down": down, "vk": vk,
                            "name": VK_TO_NAME.get(vk), "char": vk_char(vk)})
@@ -659,9 +818,76 @@ class Bridge:
         return False
 
 
+    # ---- controlling the peer (macOS event taps)
+    def _mac_mouse(self, etype, event):
+        Q = Quartz
+        if Q.CGEventGetIntegerValueField(event, Q.kCGEventSourceUnixProcessID) != 0:
+            return event                      # injected by a program (e.g. us, while being controlled)
+        if self.state == REMOTE:
+            self._mac_forward_mouse(etype, event)
+            return None                       # swallow it: this input belongs to the other PC
+        if (self.state == LOCAL and etype == Q.kCGEventMouseMoved and self.chan is not None
+                and self.can_control()):
+            p = Q.CGEventGetLocation(event)
+            if self._hit_edge(p.x, p.y) and self._enter_remote(p.x, p.y):
+                return None
+        return event
+
+    def _mac_forward_mouse(self, etype, event):
+        Q = Quartz
+        if etype in (Q.kCGEventMouseMoved, Q.kCGEventLeftMouseDragged,
+                     Q.kCGEventRightMouseDragged, Q.kCGEventOtherMouseDragged):
+            dx = Q.CGEventGetIntegerValueField(event, Q.kCGMouseEventDeltaX)
+            dy = Q.CGEventGetIntegerValueField(event, Q.kCGMouseEventDeltaY)
+            if dx or dy:
+                self.send({"t": "move", "dx": int(dx), "dy": int(dy)})
+        elif etype in (Q.kCGEventLeftMouseDown, Q.kCGEventLeftMouseUp):
+            self.send({"t": "btn", "b": "left", "down": etype == Q.kCGEventLeftMouseDown})
+        elif etype in (Q.kCGEventRightMouseDown, Q.kCGEventRightMouseUp):
+            self.send({"t": "btn", "b": "right", "down": etype == Q.kCGEventRightMouseDown})
+        elif etype in (Q.kCGEventOtherMouseDown, Q.kCGEventOtherMouseUp):
+            n = Q.CGEventGetIntegerValueField(event, Q.kCGMouseEventButtonNumber)
+            b = {2: "middle", 3: "x1", 4: "x2"}.get(int(n))
+            if b:
+                self.send({"t": "btn", "b": b, "down": etype == Q.kCGEventOtherMouseDown})
+        elif etype == Q.kCGEventScrollWheel:
+            # macOS reports lines; a wheel notch on Windows is ~3 lines
+            dy = Q.CGEventGetDoubleValueField(event, Q.kCGScrollWheelEventFixedPtDeltaAxis1) / 3.0
+            dx = -Q.CGEventGetDoubleValueField(event, Q.kCGScrollWheelEventFixedPtDeltaAxis2) / 3.0
+            if dx or dy:
+                self.send({"t": "scroll", "dx": dx, "dy": dy})
+
+    def _mac_key(self, etype, event):
+        Q = Quartz
+        if self.state != REMOTE:
+            return event
+        if etype not in (Q.kCGEventKeyDown, Q.kCGEventKeyUp, Q.kCGEventFlagsChanged):
+            return None                       # media/system keys: don't act on this Mac either
+        if Q.CGEventGetIntegerValueField(event, Q.kCGEventSourceUnixProcessID) != 0:
+            return event
+        vk = int(Q.CGEventGetIntegerValueField(event, Q.kCGKeyboardEventKeycode))
+        if etype == Q.kCGEventFlagsChanged:
+            if vk == MAC_CAPS:                # caps lock toggles: tap it on the other side
+                for down in (True, False):
+                    self.send({"t": "key", "down": down, "vk": vk, "name": "caps_lock", "char": None})
+                return None
+            bit = MAC_MOD_BITS.get(vk)
+            if bit is None:
+                return None
+            down = bool(Q.CGEventGetFlags(event) & bit)
+        else:
+            down = etype == Q.kCGEventKeyDown
+            if down and vk == MAC_ESC and self._esc_pressed():
+                return None
+        self.send({"t": "key", "down": down, "vk": vk,
+                   "name": VK_TO_NAME.get(vk), "char": MAC_CHARS.get(vk)})
+        return None
+
+
 # --------------------------------------------------------------------------- config
 def load_config():
-    cfg = {"peer": "", "port": DEFAULT_PORT, "password": "", "side": "right", "clipboard": True}
+    cfg = {"peer": "", "port": DEFAULT_PORT, "password": "", "side": "right", "clipboard": True,
+           "primary": False}
     for path in (CONFIG_PATH, OLD_CONFIG_PATH):  # first one found wins
         try:
             with open(path, encoding="utf-8") as f:
@@ -728,7 +954,7 @@ def make_tray(menu_items, title):
 # --------------------------------------------------------------------------- GUI
 def run_gui():
     import tkinter as tk
-    from tkinter import messagebox, scrolledtext, ttk
+    from tkinter import messagebox, ttk
 
     cfg = load_config()
     root = tk.Tk()
@@ -773,14 +999,47 @@ def run_gui():
         ttk.Radiobutton(sf, text=s.capitalize(), value=s, variable=side_v).pack(side="left", padx=2)
 
     clip_v = tk.BooleanVar(value=cfg.get("clipboard", True))
-    ttk.Checkbutton(frm, text="Share clipboard (text)", variable=clip_v).grid(
-        column=0, row=6, columnspan=2, sticky="w", pady=4)
+    ttk.Checkbutton(frm, text="Share clipboard both ways (text)", variable=clip_v).grid(
+        column=0, row=6, columnspan=4, sticky="w", pady=(4, 0))
 
+    prim_v = tk.BooleanVar(value=cfg.get("primary", False))
+
+    def on_primary():  # applies at once, even while connected
+        cfg["primary"] = prim_v.get()
+        save_config(cfg)
+        if state["bridge"]:
+            state["bridge"].set_primary(prim_v.get())
+
+    prim_cb = ttk.Checkbutton(frm, text="Primary controller (only this PC controls the other)",
+                              variable=prim_v, command=on_primary)
+    prim_cb.grid(column=0, row=7, columnspan=4, sticky="w", pady=(2, 4))
+    if not CAN_CONTROL:
+        prim_cb.state(["disabled"])
+
+    # status line with a disclosure arrow that shows/hides the log
     status_v = tk.StringVar(value="Stopped")
-    ttk.Label(frm, textvariable=status_v, foreground="#0a5").grid(column=0, row=8, columnspan=4, sticky="w", pady=4)
+    srow = ttk.Frame(frm)
+    srow.grid(column=0, row=9, columnspan=4, sticky="w", pady=4)
+    arrow = ttk.Label(srow, text="\u25b8", width=2, cursor="hand2")
+    arrow.pack(side="left")
+    status_lbl = ttk.Label(srow, textvariable=status_v, foreground="#0a5", cursor="hand2")
+    status_lbl.pack(side="left")
 
-    logbox = scrolledtext.ScrolledText(frm, width=70, height=10, state="disabled", font=("Consolas", 9))
-    logbox.grid(column=0, row=9, columnspan=4, pady=(4, 0))
+    logbox = tk.Text(frm, width=72, height=10, state="disabled", wrap="word", font="TkFixedFont",
+                     borderwidth=0, highlightthickness=0, padx=6, pady=4)  # no scrollbar: wheel scrolls
+
+    def toggle_log(_=None):
+        state["log_open"] = not state.get("log_open")
+        if state["log_open"]:
+            logbox.grid(column=0, row=10, columnspan=4, pady=(2, 0))
+            logbox.see("end")
+            arrow.config(text="\u25be")
+        else:
+            logbox.grid_remove()
+            arrow.config(text="\u25b8")
+
+    for w in (arrow, status_lbl):
+        w.bind("<Button-1>", toggle_log)
 
     def log(s):
         events.put(("log", time.strftime("%H:%M:%S ") + s))
@@ -805,7 +1064,7 @@ def run_gui():
             messagebox.showwarning(APP, "Port must be a number.")
             return
         new = {"peer": peer_v.get().strip(), "port": port, "password": pw_v.get(),
-               "side": side_v.get(), "clipboard": clip_v.get()}
+               "side": side_v.get(), "clipboard": clip_v.get(), "primary": prim_v.get()}
         cfg.update(new)
         save_config(cfg)
         b = Bridge(dict(cfg), log, status)
@@ -822,7 +1081,7 @@ def run_gui():
                 pass
 
     btn = ttk.Button(frm, text="Start", command=toggle)
-    btn.grid(column=0, row=7, sticky="w", pady=4)
+    btn.grid(column=0, row=8, sticky="w", pady=4)
 
     def pump():
         while True:
@@ -903,6 +1162,8 @@ def run_cli(args):
             cfg[k] = v
     if args.no_clipboard:
         cfg["clipboard"] = False
+    if args.primary:
+        cfg["primary"] = True
     if args.code:
         cfg["password"] = args.code
     if not cfg["password"]:
@@ -937,6 +1198,7 @@ def main():
     p.add_argument("--password", help=argparse.SUPPRESS)  # 1.0 name for --code
     p.add_argument("--side", choices=["left", "right", "top", "bottom"], help="where the other PC sits")
     p.add_argument("--no-clipboard", action="store_true")
+    p.add_argument("--primary", action="store_true", help="only this PC may control the other")
     args = p.parse_args()
     if args.nogui:
         run_cli(args)

@@ -5,14 +5,15 @@ A small ShareMouse-style app for your local network.
 ## Features
 - Move the cursor off the screen edge that faces the other PC, and your mouse and keyboard now control that PC.
 - Move it back off the opposite edge to return.
-- Text clipboard follows the cursor (copy on one PC, paste on the other).
+- **Shared clipboard, both ways**: copy text on either PC and paste it on the other, straight away.
 - Mouse buttons (left, right, middle, back and forward), scroll wheel, and the full keyboard, including shortcuts like Ctrl+C or Alt+Tab.
-- Both directions: either Windows PC can control the other.
+- **Both directions**: Windows and Mac PCs can each control the other. Tick **Primary controller** on one PC to make it the only one that controls; leave it unticked on both and either PC can take over. The setting applies immediately, even while connected.
 - **Finds the other PC automatically**: type the same pairing code on both PCs and they connect. No IP address needed.
 - AES-256-GCM encryption keyed from the pairing code. A PC with a different code is ignored.
 - Reconnects automatically, and sends a heartbeat every 2 s. If the link drops, control returns to your PC.
 - **Runs in the background**: closing the window hides it to the system tray (Windows) or the menu bar (Mac). Use the tray icon to show the window, start or stop sharing, or quit. When started with Windows, it goes straight to the tray.
-- **Scroll Lock = emergency button**: control comes straight back to your PC.
+- **Emergency return**: press **Esc three times** quickly (or Scroll Lock on Windows) and control comes straight back to your PC.
+- The log is tucked away: click the little arrow next to the status line to show or hide it.
 - Multi-monitor support (it uses the edge of the whole desktop) and correct handling of DPI scaling.
 
 ## Setup (2 minutes)
@@ -26,15 +27,17 @@ A small ShareMouse-style app for your local network.
 
 Want a single `.exe` with no Python? Run `build_exe.bat` once, then copy `dist\Mousync.exe` to both PCs.
 
-Terminal mode: `python mousync.py --nogui --code K7MQ-2PXH --side right [--peer 192.168.1.20]` (omit `--code` to have one generated)
+Terminal mode: `python mousync.py --nogui --code K7MQ-2PXH --side right [--peer 192.168.1.20] [--primary]` (omit `--code` to have one generated)
 
 ## Notes
 - **How auto-connect works:** each PC broadcasts a small beacon on UDP 24851 every second. The beacon has an HMAC proof made from the pairing code, never the code itself. A PC that sees a beacon with a matching proof connects to it.
 - **Admin windows:** to control windows running as administrator (Task Manager, installers), run Mousync as administrator. Windows blocks input into elevated apps otherwise.
 - **Ctrl+Alt+Del** can't be forwarded. Windows reserves it.
-- **macOS/Linux:** these can be *controlled* by a Windows PC. On macOS, allow the app under System Settings → Privacy & Security → Accessibility (and Input Monitoring). Controlling from a Mac is not built yet.
-- **Mac keyboard mapping:** the Windows key acts as Cmd on a Mac.
-- **While controlling:** the local cursor sits parked in the middle of your screen.
+- **macOS:** allow Mousync under System Settings → Privacy & Security → **Accessibility** and **Input Monitoring**, then restart it. Without these it can't control or be controlled.
+- **Linux:** can be controlled, but can't control the other PC.
+- **Mac ↔ Windows keys:** Cmd and Ctrl swap places, so the usual shortcuts just work. Cmd+C on a Mac keyboard is Ctrl+C on Windows, and Ctrl+C on a Windows keyboard is Cmd+C on a Mac. Option = Alt.
+- **While controlling:** the local cursor stays parked in the middle of your screen.
+- **Clipboard:** text only (not images or files).
 - Settings are saved to `~/.mousync.json`.
 
 ## Building the installers (Mousync-Setup.exe + Mousync.dmg)
