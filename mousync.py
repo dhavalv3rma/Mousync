@@ -1544,6 +1544,26 @@ def make_tray(menu_items, title):
                 self._icon_image = img
                 self._status_item.button().setImage_(img)
 
+            def _update_menu(self):
+                # Keep the menu off the status item so a left click reaches __call__ (toggle sharing);
+                # right click / Ctrl+click pops the menu up on demand instead.
+                super()._update_menu()
+                self._status_item.setMenu_(None)
+                self._status_item.button().sendActionOn_(
+                    AppKit.NSEventMaskLeftMouseUp | AppKit.NSEventMaskRightMouseUp)
+
+            def __call__(self):
+                ev = AppKit.NSApplication.sharedApplication().currentEvent()
+                menu_click = ev is not None and (
+                    ev.type() == AppKit.NSEventTypeRightMouseUp
+                    or ev.modifierFlags() & AppKit.NSEventModifierFlagControl)
+                if menu_click and self._menu_handle:
+                    self._status_item.setMenu_(self._menu_handle[0])
+                    self._status_item.button().performClick_(None)
+                    self._status_item.setMenu_(None)
+                else:
+                    super().__call__()
+
         img = Image.open(os.path.join(ASSET_DIR, "tray_mac.png"))
         icon = MacIcon(APP, img, title, pystray.Menu(*menu_items))
         icon.run_detached()          # Tk's main loop drives the Cocoa event loop
@@ -2549,6 +2569,11 @@ def run_gui():
             where = "menu bar" if IS_MAC else "system tray"
             log(f"Still running in the background. Use the {where} icon to show or quit {APP}.")
 
+    def tray_toggle():  # clicking the tray / menu-bar icon starts or stops sharing
+        if not state["bridge"] and len(get_code()) != 8:
+            show_window()  # can't connect without a pairing code: show where to enter it
+        toggle()
+
     def quit_app():
         if state["bridge"]:
             state["bridge"].stop()
@@ -2569,8 +2594,9 @@ def run_gui():
     try:
         import pystray
         state["tray"] = make_tray([
-            pystray.MenuItem(f"Show {APP}", ui(show_window), default=True),
-            pystray.MenuItem(lambda _: "Stop sharing" if state["bridge"] else "Start sharing", ui(toggle)),
+            pystray.MenuItem(f"Show {APP}", ui(show_window)),
+            pystray.MenuItem(lambda _: "Stop sharing" if state["bridge"] else "Start sharing",
+                             ui(tray_toggle), default=True),
             pystray.MenuItem("Send files...", ui(lambda: (show_window(), send_files_dialog()))),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(f"Quit {APP}", ui(quit_app)),
