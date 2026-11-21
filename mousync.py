@@ -446,9 +446,13 @@ MAC_MOD_BITS = {0x3B: 0x01, 0x38: 0x02, 0x3C: 0x04, 0x37: 0x08, 0x36: 0x10,
                 0x3A: 0x20, 0x3D: 0x40, 0x3E: 0x2000}
 MAC_CAPS = 0x39
 MAC_ESC, VK_ESCAPE = 0x35, 0x1B
-# Between a Mac and a PC, Cmd and Ctrl trade places so Cmd+C on a Mac keyboard is Ctrl+C on Windows.
+# PC keys replayed on a Mac: Ctrl and Win(Cmd) trade places so Ctrl+C on a PC keyboard is Cmd+C.
 CMD_CTRL_SWAP = {"cmd": "ctrl", "cmd_l": "ctrl_l", "cmd_r": "ctrl_r",
                  "ctrl": "cmd", "ctrl_l": "cmd_l", "ctrl_r": "cmd_r"}
+# Mac keys replayed on a PC, so each physical key does what its PC-keyboard counterpart does:
+# Ctrl -> Ctrl, the key the Mac reports as Cmd -> Alt, the key it reports as Option -> Win.
+MAC_TO_PC_MODS = {"cmd": "alt", "cmd_l": "alt_l", "cmd_r": "alt_r",
+                  "alt": "cmd", "alt_l": "cmd_l", "alt_r": "cmd_r"}
 
 
 def vk_char(vk):
@@ -464,7 +468,9 @@ def portable_to_key(m, peer_os):
         return KeyCode.from_vk(m["vk"])  # same OS: replay the exact key
     name = m.get("name")
     if name:
-        if (OSNAME == "mac") != (peer_os == "mac"):
+        if peer_os == "mac" and OSNAME != "mac":
+            name = MAC_TO_PC_MODS.get(name, name)
+        elif OSNAME == "mac" and peer_os != "mac":
             name = CMD_CTRL_SWAP.get(name, name)
         try:
             return Key[name]
