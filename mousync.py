@@ -66,7 +66,9 @@ if IS_MAC:  # pyobjc ships with pynput / pystray on macOS
                       "CFRunLoopGetCurrent", "CFRunLoopAddSource", "CFRunLoopRun", "CFRunLoopStop",
                       "CGEventGetIntegerValueField", "CGEventGetDoubleValueField", "CGEventGetLocation",
                       "CGEventGetFlags", "CGWarpMouseCursorPosition", "CGAssociateMouseAndMouseCursorPosition",
-                      "CGGetActiveDisplayList", "CGDisplayBounds"):
+                      "CGGetActiveDisplayList", "CGDisplayBounds", "CGEventSourceCreate",
+                      "CGEventSourceSetLocalEventsSuppressionInterval", "CGSetLocalEventsSuppressionInterval",
+                      "CGEventCreateMouseEvent", "CGEventPost"):
             getattr(Quartz, _name)
         for _name in ("AXIsProcessTrusted", "AXIsProcessTrustedWithOptions"):
             getattr(HIServices, _name)
@@ -138,6 +140,36 @@ def mac_lock_cursor(locked):
     Unlocking also cancels the ~0.25 s pause macOS puts on real mouse input after a cursor warp."""
     if IS_MAC and Quartz is not None:
         Quartz.CGAssociateMouseAndMouseCursorPosition(not locked)
+
+
+_mac_src = []
+
+
+def mac_return_cursor(x, y):
+    """Hand the Mac cursor back to the local mouse at (x, y) with no input pause.
+    A bare warp makes macOS ignore the trackpad until the finger is lifted (the cursor 'sticks' at
+    the edge), so: turn off the post-warp suppression, re-link mouse and cursor, warp, then post a
+    real mouse-moved event so the window server takes the new position as genuine input."""
+    if not (IS_MAC and Quartz is not None):
+        return
+    Q = Quartz
+    try:
+        if not _mac_src:
+            src = Q.CGEventSourceCreate(Q.kCGEventSourceStateCombinedSessionState)
+            Q.CGEventSourceSetLocalEventsSuppressionInterval(src, 0.0)
+            _mac_src.append(src)
+        Q.CGSetLocalEventsSuppressionInterval(0.0)
+    except Exception:
+        pass
+    Q.CGAssociateMouseAndMouseCursorPosition(True)
+    Q.CGWarpMouseCursorPosition((float(x), float(y)))
+    try:
+        ev = Q.CGEventCreateMouseEvent(_mac_src[0] if _mac_src else None, Q.kCGEventMouseMoved,
+                                       (float(x), float(y)), Q.kCGMouseButtonLeft)
+        Q.CGEventPost(Q.kCGHIDEventTap, ev)
+    except Exception:
+        pass
+    Q.CGAssociateMouseAndMouseCursorPosition(True)   # lifts any pause the warp still set
 
 
 def set_fallback_bounds(width, height):
@@ -1331,8 +1363,10 @@ class Bridge:
         """Call with self.lock held."""
         self.state = LOCAL
         self.cooldown = time.time() + 0.4
-        warp_cursor(*edge_point(self.cfg["side"], ratio, 6))
-        mac_lock_cursor(False)   # after the warp: also lifts macOS's post-warp input pause
+        if IS_MAC:
+            mac_return_cursor(*edge_point(self.cfg["side"], ratio, 6))
+        else:
+            warp_cursor(*edge_point(self.cfg["side"], ratio, 6))
         if notify:
             self.send({"t": "release"})
         self.status(self.base_status())
